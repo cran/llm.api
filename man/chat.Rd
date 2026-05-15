@@ -11,7 +11,7 @@ chat(prompt, model = NULL, system = NULL, history = NULL, temperature = NULL,
 \arguments{
 \item{prompt}{Character. The user message to send.}
 
-\item{model}{Character. Model name (e.g., "gpt-4o", "claude-3-5-sonnet-latest", "llama3.2").}
+\item{model}{Character. Model name (e.g., "gpt-4o", "claude-sonnet-4-6", "llama3.2").}
 
 \item{system}{Character or NULL. System prompt to set context.}
 
@@ -31,8 +31,20 @@ chat(prompt, model = NULL, system = NULL, history = NULL, temperature = NULL,
 \value{
 A list with:
   \item{content}{The assistant's response text}
+  \item{thinking}{Chain-of-thought from reasoning models, or NULL.
+    Populated from \code{reasoning_content} (DeepSeek, Moonshot Kimi,
+    vLLM, SGLang), \code{reasoning} (OpenRouter), or Anthropic
+    \code{thinking} blocks. Normalized across providers.}
+  \item{finish_reason}{Why generation stopped. \code{"stop"} on a
+    normal completion, \code{"length"} when truncated by max_tokens.
+    A reasoning model that returns empty \code{content} with
+    \code{finish_reason == "length"} ran out of budget mid-thought;
+    raise \code{max_tokens}.}
   \item{model}{Model used}
-  \item{usage}{Token usage (if available)}
+  \item{usage}{Token usage (if available). When the model is in the
+    bundled price snapshot, also carries \code{cost} as a USD scalar;
+    Ollama is treated as free (\code{cost = 0}); unknown models leave
+    \code{cost = NA_real_}. See \code{\link{prices_snapshot_date}}.}
   \item{history}{Updated conversation history}
 }
 \description{
