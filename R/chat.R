@@ -1,11 +1,54 @@
 # Core chat functionality
 
+# Validate a thinking budget against Anthropic's documented
+# constraints: it must be a positive integer of at least 1024 tokens,
+# and (when max_tokens is set) it must leave room for the regular
+# completion -- the budget is counted within max_tokens.
+.validate_thinking_budget <- function(thinking_budget_tokens,
+                                      max_tokens = NULL) {
+    if (!is.numeric(thinking_budget_tokens) ||
+        length(thinking_budget_tokens) != 1L ||
+        is.na(thinking_budget_tokens) ||
+        thinking_budget_tokens != as.integer(thinking_budget_tokens)) {
+        stop("`thinking_budget_tokens` must be a single integer.",
+             call. = FALSE)
+    }
+    if (thinking_budget_tokens < 1024L) {
+        stop("`thinking_budget_tokens` must be at least 1024 ",
+             "(Anthropic's documented minimum).", call. = FALSE)
+    }
+    if (!is.null(max_tokens) &&
+        thinking_budget_tokens >= as.integer(max_tokens)) {
+        stop("`thinking_budget_tokens` (", thinking_budget_tokens,
+             ") must be strictly less than `max_tokens` (",
+             max_tokens, "); the thinking budget counts against ",
+             "max_tokens and must leave room for the completion.",
+             call. = FALSE)
+    }
+    invisible(TRUE)
+}
+
+# Wrap the system message in a cache_control block when caching is
+# requested, or pass it through as plain text when cache == "none".
+# The "5m" and "1h" values map to Anthropic's ephemeral cache TTLs.
+.anthropic_system_with_cache <- function(system_msg, cache) {
+    if (identical(cache, "none")) {
+        return(system_msg)
+    }
+    control <- if (identical(cache, "1h")) {
+        list(type = "ephemeral", ttl = "1h")
+    } else {
+        list(type = "ephemeral")
+    }
+    list(list(type = "text", text = system_msg, cache_control = control))
+}
+
 #' Chat with an LLM
 #'
 #' Send a message to a Large Language Model and get a response.
 #'
 #' @param prompt Character. The user message to send.
-#' @param model Character. Model name (e.g., "gpt-4o", "claude-sonnet-4-6", "llama3.2").
+#' @param model Character. Model name (e.g., "gpt-5.4-mini", "claude-sonnet-4-6", "qwen3.5:9b").
 #' @param system Character or NULL. System prompt to set context.
 #' @param history List or NULL. Previous conversation turns.
 #' @param temperature Numeric or NULL. Sampling temperature (0-2).
@@ -13,6 +56,14 @@
 #' @param provider Character. Provider: "auto", "openai", "anthropic",
 #'   "moonshot", or "ollama".
 #' @param stream Logical. Stream the response (prints as it arrives).
+#' @param cache Character. Anthropic prompt caching for the system
+#'   message: \code{"none"} (default), \code{"5m"}, or \code{"1h"}
+#'   ephemeral TTL. Anthropic-only; warns and degrades to \code{"none"}
+#'   for other providers.
+#' @param thinking_budget_tokens Integer or NULL. Anthropic extended
+#'   thinking budget; must be at least 1024 and less than
+#'   \code{max_tokens}. Anthropic-only; ignored with a warning for
+#'   other providers.
 #' @param ... Additional parameters passed to the API.
 #'
 #' @return A list with:
@@ -49,13 +100,37 @@
 chat <- function(prompt, model = NULL, system = NULL, history = NULL,
                  temperature = NULL, max_tokens = NULL,
                  provider = c("auto", "openai", "anthropic", "moonshot", "ollama"),
-                 stream = FALSE, ...) {
+                 stream = FALSE, cache = c("none", "5m", "1h"),
+                 thinking_budget_tokens = NULL, ...) {
     provider <- match.arg(provider)
+    cache <- match.arg(cache)
 
-    # Auto-detect provider from model name or base URL
+    # Validate the thinking-budget range up front. This is provider-
+    # independent input validation and should fail fast, before any
+    # provider resolution.
+    if (!is.null(thinking_budget_tokens)) {
+        .validate_thinking_budget(thinking_budget_tokens, max_tokens)
+    }
 
+    # Resolve "auto" to a concrete provider before the Anthropic-only
+    # guards below, otherwise they compare against "auto" and wrongly
+    # disable cache / thinking_budget_tokens for genuine Anthropic calls.
     if (provider == "auto") {
         provider <- .detect_provider(model)
+    }
+
+    # Anthropic-only feature opt-ins emit a one-time warning when a
+    # non-default value is passed against another provider so the
+    # caller knows the request will be silently degraded.
+    if (!identical(cache, "none") && !identical(provider, "anthropic")) {
+        warning("`cache` is Anthropic-only; ignoring for provider \"",
+                provider, "\".", call. = FALSE)
+        cache <- "none"
+    }
+    if (!is.null(thinking_budget_tokens) && !identical(provider, "anthropic")) {
+        warning("`thinking_budget_tokens` is Anthropic-only; ignoring ",
+                "for provider \"", provider, "\".", call. = FALSE)
+        thinking_budget_tokens <- NULL
     }
 
     # Get provider config
@@ -99,7 +174,9 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
 
     # Make request
     if (provider == "anthropic") {
-        result <- .chat_anthropic(body, config, stream)
+        result <- .chat_anthropic(body, config, stream,
+                                  cache = cache,
+                                  thinking_budget_tokens = thinking_budget_tokens)
     } else {
         result <- .chat_openai_compatible(body, config, stream)
     }
@@ -123,19 +200,17 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
     )
 }
 
-# Attach a USD cost field to a provider-shaped usage list. Anthropic
-# returns input_tokens/output_tokens, OpenAI-compatible returns
-# prompt_tokens/completion_tokens; we read whichever is present. Cost
-# is appended without renaming the existing token fields so callers
-# that already destructure usage keep working.
+# Attach a USD cost field to a provider-shaped usage list. Delegates to
+# usage_cost(), which reads the Anthropic or OpenAI-compatible token
+# shape and accounts for prompt caching. Cost is appended without
+# renaming the existing token fields so callers that already
+# destructure usage keep working.
 #' @noRd
 .augment_usage_with_cost <- function(usage, model, provider) {
     if (is.null(usage)) {
         return(usage)
     }
-    input_tokens <- usage$input_tokens %||% usage$prompt_tokens
-    output_tokens <- usage$output_tokens %||% usage$completion_tokens
-    usage$cost <- .cost_for(model, provider, input_tokens, output_tokens)
+    usage$cost <- usage_cost(model, provider, usage)
     usage
 }
 
@@ -143,6 +218,17 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
 #' @noRd
 .chat_openai_compatible <- function(body, config, stream) {
     url <- paste0(config$base_url, config$chat_path)
+
+    # OpenAI deprecated max_tokens in favor of max_completion_tokens
+    # and reasoning (o-series) models reject max_tokens entirely. Map
+    # for the OpenAI endpoint only; Moonshot and Ollama (which share
+    # this helper) still expect max_tokens.
+    if (identical(config$provider, "openai") &&
+        !is.null(body$max_tokens) &&
+        is.null(body$max_completion_tokens)) {
+        body$max_completion_tokens <- body$max_tokens
+        body$max_tokens <- NULL
+    }
 
     headers <- c("Content-Type" = "application/json")
 
@@ -197,7 +283,8 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
 
 #' Anthropic chat request
 #' @noRd
-.chat_anthropic <- function(body, config, stream) {
+.chat_anthropic <- function(body, config, stream, cache = "none",
+                            thinking_budget_tokens = NULL) {
     url <- paste0(config$base_url, config$chat_path)
 
     # Convert messages format for Anthropic
@@ -216,11 +303,18 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
                            max_tokens = body$max_tokens %||% 4096)
 
     if (!is.null(system_msg)) {
-        anthropic_body$system <- system_msg
+        anthropic_body$system <- .anthropic_system_with_cache(system_msg, cache)
     }
 
     if (!is.null(body$temperature)) {
         anthropic_body$temperature <- body$temperature
+    }
+
+    if (!is.null(thinking_budget_tokens)) {
+        anthropic_body$thinking <- list(
+                                        type = "enabled",
+                                        budget_tokens = as.integer(thinking_budget_tokens)
+        )
     }
 
     headers <- c(

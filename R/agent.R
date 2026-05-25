@@ -15,13 +15,34 @@
 #' @param max_turns Integer. Maximum tool-use turns (default: 20).
 #' @param verbose Logical. Print tool calls and results.
 #' @param history List or NULL. Previous conversation history to continue from.
+#' @param history_callback Function or NULL. Called as
+#'   \code{history_callback(history)} after each assistant message is
+#'   appended and after each tool result is appended. Lets callers
+#'   snapshot intermediate state so an interrupt mid-turn doesn't lose
+#'   the work that was already done. Errors raised inside the callback
+#'   are swallowed so telemetry/snapshotting can't break a turn.
+#' @param cache Character. Anthropic prompt caching for the system
+#'   message: \code{"none"} (default), \code{"5m"}, or \code{"1h"}
+#'   ephemeral TTL. Anthropic-only; warns and degrades to \code{"none"}
+#'   for other providers.
+#' @param thinking_budget_tokens Integer or NULL. Anthropic extended
+#'   thinking budget; must be at least 1024 and less than
+#'   \code{max_tokens}. Anthropic-only; ignored with a warning for
+#'   other providers.
 #' @param ... Additional parameters passed to the API.
 #'
 #' @return List with final response and conversation history. The
 #'   returned \code{$usage} carries cumulative \code{input_tokens},
 #'   \code{output_tokens}, \code{total_tokens}, and \code{cost} (USD
 #'   scalar, derived from the bundled price snapshot; \code{0} for
-#'   Ollama; \code{NA_real_} for models not in the snapshot).
+#'   Ollama; \code{NA_real_} for models not in the snapshot). It also
+#'   carries cumulative cache activity: \code{cache_read_input_tokens}
+#'   (Anthropic cache reads plus OpenAI/Moonshot cached prompt tokens),
+#'   \code{cache_creation_input_tokens} (total Anthropic cache writes),
+#'   and the per-TTL split \code{cache_creation$ephemeral_5m_input_tokens}
+#'   / \code{cache_creation$ephemeral_1h_input_tokens}. Passing this
+#'   \code{$usage} back to \code{\link{usage_cost}} recomputes the same
+#'   \code{cost}.
 #' @export
 #'
 #' @examples
@@ -41,8 +62,31 @@
 agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
                   model = NULL,
                   provider = c("anthropic", "openai", "moonshot", "ollama"),
-                  max_turns = 20L, verbose = TRUE, history = NULL, ...) {
+                  max_turns = 20L, verbose = TRUE, history = NULL,
+                  history_callback = NULL, cache = c("none", "5m", "1h"),
+                  thinking_budget_tokens = NULL, ...) {
     provider <- match.arg(provider)
+    cache <- match.arg(cache)
+
+    # Anthropic-only feature opt-ins emit a one-time warning when a
+    # non-default value is passed against another provider so the
+    # caller knows the request will be silently degraded.
+    if (!identical(cache, "none") && !identical(provider, "anthropic")) {
+        warning("`cache` is Anthropic-only; ignoring for provider \"",
+                provider, "\".", call. = FALSE)
+        cache <- "none"
+    }
+    if (!is.null(thinking_budget_tokens)) {
+        # max_tokens flows in via ...; pull it out for validation.
+        extra_validate <- list(...)
+        .validate_thinking_budget(thinking_budget_tokens,
+                                  max_tokens = extra_validate$max_tokens)
+        if (!identical(provider, "anthropic")) {
+            warning("`thinking_budget_tokens` is Anthropic-only; ignoring ",
+                    "for provider \"", provider, "\".", call. = FALSE)
+            thinking_budget_tokens <- NULL
+        }
+    }
 
     if (is.null(tool_handler) && length(tools) > 0) {
         stop("tool_handler required when tools are provided", call. = FALSE)
@@ -52,9 +96,9 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
 
     # Default models with tool support
     if (is.null(model)) {
-        model <- switch(provider, anthropic = "claude-sonnet-4-20250514",
-                        openai = "gpt-4o", moonshot = "kimi-k2",
-                        ollama = "llama3.2")
+        model <- switch(provider, anthropic = "claude-sonnet-4-6",
+                        openai = "gpt-5.4-mini", moonshot = "kimi-k2.5",
+                        ollama = "qwen3.5:9b")
     }
 
     # Convert tools to provider format
@@ -70,32 +114,60 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
 
     turn <- 0L
 
-    # Track cumulative token usage
+    # Track cumulative token usage and cost. Cost is summed per turn:
+    # cache token classes are per-response, so pricing each turn and
+    # adding is correct and lets a single unpriceable turn propagate to
+    # an NA total.
     total_input_tokens <- 0L
     total_output_tokens <- 0L
+    total_cache_read <- 0L
+    total_cache_write_5m <- 0L
+    total_cache_write_1h <- 0L
+    total_cost <- 0
+    cost_na <- FALSE
 
     while (turn < max_turns) {
         turn <- turn + 1L
 
         # Make API request with tools
         response <- switch(provider,
-                           anthropic = .agent_anthropic(messages, provider_tools, system, model, config, ...),
+                           anthropic = .agent_anthropic(messages, provider_tools, system, model, config,
+                cache = cache,
+                thinking_budget_tokens = thinking_budget_tokens, ...),
                            openai = .agent_openai(messages, provider_tools, system, model, config, ...),
                            moonshot = .agent_openai(messages, provider_tools, system, model, config, ...),
                            ollama = .agent_ollama(messages, provider_tools, system, model, config, ...)
         )
 
-        # Accumulate token usage
+        # Accumulate token usage and per-turn cost. Uses `[[` exact
+        # matching throughout: `$` would partial-match (e.g.
+        # prompt_tokens -> prompt_tokens_details).
         if (!is.null(response$usage)) {
+            u <- response$usage
             # Anthropic format
-            if (!is.null(response$usage$input_tokens)) {
-                total_input_tokens <- total_input_tokens + response$usage$input_tokens
-                total_output_tokens <- total_output_tokens + response$usage$output_tokens
+            if (!is.null(u[["input_tokens"]])) {
+                total_input_tokens <- total_input_tokens + u[["input_tokens"]]
+                total_output_tokens <- total_output_tokens + u[["output_tokens"]]
             }
             # OpenAI/Ollama format
-            if (!is.null(response$usage$prompt_tokens)) {
-                total_input_tokens <- total_input_tokens + response$usage$prompt_tokens
-                total_output_tokens <- total_output_tokens + response$usage$completion_tokens
+            if (!is.null(u[["prompt_tokens"]])) {
+                total_input_tokens <- total_input_tokens + u[["prompt_tokens"]]
+                total_output_tokens <- total_output_tokens + u[["completion_tokens"]]
+            }
+            # Cache token classes via the shared extractor so the
+            # per-TTL Anthropic write split is captured (not just the
+            # flat total); cache_read covers Anthropic reads, and
+            # .openai_cached_tokens adds OpenAI cached prompt tokens.
+            ct <- .cache_tokens(u)
+            total_cache_read <- total_cache_read + ct$read +
+                .openai_cached_tokens(u)
+            total_cache_write_5m <- total_cache_write_5m + ct$write_5m
+            total_cache_write_1h <- total_cache_write_1h + ct$write_1h
+            turn_cost <- usage_cost(model, provider, u)
+            if (is.na(turn_cost)) {
+                cost_na <- TRUE
+            } else {
+                total_cost <- total_cost + turn_cost
             }
         }
 
@@ -103,6 +175,7 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
         if (length(response$tool_calls) == 0) {
             # Append final assistant message so caller's history is complete
             messages[[length(messages) + 1]] <- response$assistant_message
+            .fire_history_callback(history_callback, messages)
             return(list(
                         content = response$text,
                         model = model,
@@ -113,17 +186,25 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
                                      input_tokens = total_input_tokens,
                                      output_tokens = total_output_tokens,
                                      total_tokens = total_input_tokens + total_output_tokens,
-                                     cost = .cost_for(model, provider, total_input_tokens, total_output_tokens)
+                                     cache_read_input_tokens = total_cache_read,
+                                     cache_creation_input_tokens = total_cache_write_5m + total_cache_write_1h,
+                                     cache_creation = list(
+                                         ephemeral_5m_input_tokens = total_cache_write_5m,
+                                         ephemeral_1h_input_tokens = total_cache_write_1h),
+                                     cost = if (cost_na) NA_real_ else total_cost
                     )
                 ))
         }
 
-        # Add assistant message
+        # Add assistant message (carries the tool_use blocks for this round)
         messages[[length(messages) + 1]] <- response$assistant_message
+        .fire_history_callback(history_callback, messages)
 
-        # Process tool calls
-        tool_results <- list()
-
+        # Process tool calls one at a time and append each result to
+        # history as it's produced, firing the callback after each.
+        # This means an interrupt mid-batch leaves the completed tools'
+        # results in the snapshot the callback received, so the caller
+        # can preserve them instead of losing the whole batch.
         for (tc in response$tool_calls) {
             if (verbose) {
                 cat(sprintf("\n[Tool: %s]\n", tc$name))
@@ -148,15 +229,13 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
                 cat(sprintf("  Result: %s\n", display))
             }
 
-            tool_results[[length(tool_results) + 1]] <- list(
-                id = tc$id,
-                name = tc$name,
-                result = result
+            messages <- .append_tool_result(
+                messages,
+                list(id = tc$id, name = tc$name, result = result),
+                provider
             )
+            .fire_history_callback(history_callback, messages)
         }
-
-        # Add tool results to messages (format varies by provider)
-        messages <- .add_tool_results(messages, tool_results, provider)
     }
 
     warning("Reached max_turns (", max_turns, ")")
@@ -170,7 +249,12 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
                       input_tokens = total_input_tokens,
                       output_tokens = total_output_tokens,
                       total_tokens = total_input_tokens + total_output_tokens,
-                      cost = .cost_for(model, provider, total_input_tokens, total_output_tokens)
+                      cache_read_input_tokens = total_cache_read,
+                      cache_creation_input_tokens = total_cache_write_5m + total_cache_write_1h,
+                      cache_creation = list(
+                          ephemeral_5m_input_tokens = total_cache_write_5m,
+                          ephemeral_1h_input_tokens = total_cache_write_1h),
+                      cost = if (cost_na) NA_real_ else total_cost
         )
     )
 }
@@ -208,16 +292,22 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
 }
 
 # Anthropic request
-.agent_anthropic <- function(messages, tools, system, model, config, ...) {
+.agent_anthropic <- function(messages, tools, system, model, config,
+                             cache = "none", thinking_budget_tokens = NULL,
+                             ...) {
     url <- paste0(config$base_url, config$chat_path)
 
     body <- list(model = model, messages = messages, max_tokens = 4096)
 
     if (!is.null(system)) {
-        body$system <- system
+        body$system <- .anthropic_system_with_cache(system, cache)
     }
     if (length(tools) > 0) {
         body$tools <- tools
+    }
+    if (!is.null(thinking_budget_tokens)) {
+        body$thinking <- list(type = "enabled",
+                              budget_tokens = as.integer(thinking_budget_tokens))
     }
 
     extra <- list(...)
@@ -273,6 +363,16 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
     }
 
     extra <- list(...)
+    # OpenAI deprecated max_tokens in favor of max_completion_tokens
+    # and reasoning (o-series) models reject max_tokens entirely. Map
+    # for the OpenAI endpoint only; Moonshot, which shares this
+    # helper, still expects max_tokens.
+    if (identical(config$provider, "openai") &&
+        !is.null(extra$max_tokens) &&
+        is.null(extra$max_completion_tokens)) {
+        extra$max_completion_tokens <- extra$max_tokens
+        extra$max_tokens <- NULL
+    }
     for (name in names(extra)) {
         body[[name]] <- extra[[name]]
     }
@@ -372,32 +472,63 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
 
 # Add tool results to message history
 .add_tool_results <- function(messages, results, provider) {
+    # Backwards-compatible batch wrapper. New code paths should call
+    # .append_tool_result directly so the history_callback in agent()
+    # can fire between each append.
+    for (r in results) {
+        messages <- .append_tool_result(messages, r, provider)
+    }
+    messages
+}
+
+# Append a single tool result to history in the provider's expected
+# shape. For Anthropic, multiple tool_results for one assistant turn
+# share a single trailing user message (extended in place); for the
+# OpenAI-family providers each tool result is its own role="tool"
+# message.
+.append_tool_result <- function(messages, result, provider) {
     switch(provider,
            anthropic = {
-        # Claude: tool_result blocks in user message
-        content <- lapply(results, function(r) {
-            list(type = "tool_result", tool_use_id = r$id, content = r$result)
-        })
-        messages[[length(messages) + 1]] <- list(role = "user",
-            content = content)
+        block <- list(type = "tool_result", tool_use_id = result$id,
+                      content = result$result)
+        last <- length(messages)
+        if (last >= 1L &&
+            identical(messages[[last]]$role, "user") &&
+            is.list(messages[[last]]$content) &&
+            length(messages[[last]]$content) > 0L &&
+            identical(messages[[last]]$content[[1]]$type, "tool_result")) {
+            # Extend the existing batch user message.
+            messages[[last]]$content <- c(messages[[last]]$content, list(block))
+        } else {
+            messages[[length(messages) + 1L]] <- list(role = "user",
+                content = list(block))
+        }
         messages
     },
-
            openai =,
            moonshot =,
            ollama = {
-        # OpenAI/Ollama: separate tool messages
-        for (r in results) {
-            messages[[length(messages) + 1]] <- list(
-                role = "tool",
-                tool_call_id = r$id,
-                name = r$name,
-                content = r$result
-            )
-        }
+        messages[[length(messages) + 1L]] <- list(
+            role = "tool",
+            tool_call_id = result$id,
+            name = result$name,
+            content = result$result
+        )
         messages
     }
     )
+}
+
+# Invoke the user-supplied history callback if any, swallowing errors.
+# Callers should pass the current full messages list; the callback
+# typically uses it to snapshot intermediate state so an interrupt
+# mid-turn doesn't lose completed tool calls.
+.fire_history_callback <- function(callback, messages) {
+    if (is.null(callback)) {
+        return(invisible(NULL))
+    }
+    tryCatch(callback(messages), error = function(e) NULL)
+    invisible(NULL)
 }
 
 # Helper: POST JSON request
