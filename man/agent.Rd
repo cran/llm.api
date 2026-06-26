@@ -4,23 +4,29 @@
 \title{Chat with tool use (agentic mode)}
 \usage{
 agent(prompt, tools = list(), tool_handler = NULL, system = NULL, model = NULL,
-      provider = c("anthropic", "openai", "moonshot", "ollama"),
+      provider = c("anthropic", "anthropic_claude", "openai", "moonshot",
+                   "openai_codex", "ollama"),
       max_turns = 20L, verbose = TRUE, history = NULL, history_callback = NULL,
-      cache = c("none", "5m", "1h"), thinking_budget_tokens = NULL, ...)
+      cache = c("none", "5m", "1h"), thinking_budget_tokens = NULL,
+      web_search = FALSE, ...)
 }
 \arguments{
 \item{prompt}{Character. The user message.}
 
 \item{tools}{List. Tool definitions (from mcp_tools_for_claude or manual).}
 
-\item{tool_handler}{Function. Called with (name, args), returns result string.}
+\item{tool_handler}{Function. Called with `(name, args)` and returns a
+result string. If it declares a formal named `context`, it also
+receives (by name) a read-only per-call snapshot with `assistant_text`
+(the model's text for this turn), `agent_turn`, `call_index`,
+`call_count`, and `provider`; two-argument handlers are called unchanged.}
 
 \item{system}{Character. System prompt.}
 
 \item{model}{Character. Model name.}
 
-\item{provider}{Character. Provider: "anthropic", "openai", "moonshot",
-or "ollama".}
+\item{provider}{Character. Provider: "anthropic", "anthropic_claude", "openai", "moonshot",
+"openai_codex", or "ollama".}
 
 \item{max_turns}{Integer. Maximum tool-use turns (default: 20).}
 
@@ -44,6 +50,19 @@ for other providers.}
 thinking budget; must be at least 1024 and less than
 \code{max_tokens}. Anthropic-only; ignored with a warning for
 other providers.}
+
+\item{web_search}{Enable provider-native (server-side) web search:
+\code{FALSE} (default), \code{TRUE}, or a list of options
+(\code{allowed_domains}, \code{user_location}). Server-side, so it is
+not gated by \code{tool_handler}; the result accumulates
+\code{citations} and \code{searches} across turns. Wired for
+\code{"openai_codex"} and \code{"openai"} (OpenAI Responses
+\code{web_search} tool; for \code{"openai"} the run is routed through
+the Responses endpoint), \code{"anthropic"},
+\code{"anthropic_claude"}, and \code{"moonshot"}
+(the \code{$web_search} builtin, whose calls are handled internally
+rather than via \code{tool_handler}); ignored with a warning
+otherwise.}
 
 \item{...}{Additional parameters passed to the API.}
 }

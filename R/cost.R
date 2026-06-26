@@ -29,8 +29,8 @@
 #' cache reads occurred but no such rate is bundled.
 #'
 #' @param model Character. Model id as sent to the provider.
-#' @param provider Character. "anthropic", "openai", "moonshot", or
-#'   "ollama".
+#' @param provider Character. "anthropic", "anthropic_claude", "openai", "moonshot",
+#'   "openai_codex", or "ollama".
 #' @param input_tokens Integer. Non-cached prompt tokens.
 #' @param output_tokens Integer. Completion tokens.
 #' @param cache_write_5m,cache_write_1h Integer. Anthropic 5-minute /
@@ -139,8 +139,8 @@
 #' [prices_snapshot_date()].
 #'
 #' @param model Character. Model id as sent to the provider.
-#' @param provider Character. "anthropic", "openai", "moonshot", or
-#'   "ollama".
+#' @param provider Character. "anthropic", "anthropic_claude", "openai", "moonshot",
+#'   "openai_codex", or "ollama".
 #' @param usage A usage list as found in `chat()$usage` or
 #'   `agent()$usage`.
 #' @return Numeric scalar (USD), or `NA_real_` when `usage` is `NULL`,
@@ -154,6 +154,11 @@
 usage_cost <- function(model, provider, usage) {
     if (is.null(usage)) {
         return(NA_real_)
+    }
+    # Subscription OAuth shares Anthropic's usage shape and prices; the figure
+    # is the API-equivalent cost.
+    if (identical(provider, "anthropic_claude")) {
+        provider <- "anthropic"
     }
     out_tokens <- usage[["output_tokens"]] %||% usage[["completion_tokens"]]
 
@@ -188,6 +193,13 @@ usage_cost <- function(model, provider, usage) {
 # litellm namespaces models that share a basename across providers.
 #' @noRd
 .price_lookup <- function(model, provider) {
+    if (identical(provider, "openai_codex")) {
+        rec <- .openai_codex_price_lookup(model)
+        if (!is.null(rec)) {
+            return(rec)
+        }
+    }
+
     rec <- .PRICES[[model]]
     if (!is.null(rec)) {
         return(rec)
@@ -199,6 +211,23 @@ usage_cost <- function(model, provider, usage) {
         }
     }
     NULL
+}
+
+.openai_codex_price_lookup <- function(model) {
+    prices <- list(
+                   `gpt-5.3-codex-spark` = list(input = 1.75 / 1e6, output = 14 / 1e6,
+            cache_read = 0.175 / 1e6),
+                   `gpt-5.4` = list(input = 2.5 / 1e6,
+                                    output = 15 / 1e6,
+                                    cache_read = 0.25 / 1e6),
+                   `gpt-5.4-mini` = list(input = 0.75 / 1e6,
+            output = 4.5 / 1e6,
+            cache_read = 0.075 / 1e6),
+                   `gpt-5.5` = list(input = 5 / 1e6,
+                                    output = 30 / 1e6,
+                                    cache_read = 0.5 / 1e6)
+    )
+    prices[[model]]
 }
 
 #' Bundled price-snapshot date
@@ -218,10 +247,10 @@ usage_cost <- function(model, provider, usage) {
 #' Cost estimates are offline and approximate, and may differ from
 #' current provider billing. Cached-input pricing follows each
 #' provider's published model: OpenAI
-#' (\url{https://platform.openai.com/docs/guides/prompt-caching}),
+#' (\url{https://developers.openai.com/api/docs/guides/prompt-caching}),
 #' Moonshot (\url{https://www.kimi.com/help/kimi-api/api-pricing}), and
 #' Anthropic
-#' (\url{https://platform.claude.com/en/docs/build-with-claude/prompt-caching}).
+#' (\url{https://platform.claude.com/docs/en/build-with-claude/prompt-caching}).
 #'
 #' @return Character scalar in `YYYY-MM-DD` format.
 #' @seealso [prices_snapshot_stale()], [usage_cost()]
@@ -250,4 +279,3 @@ prices_snapshot_stale <- function(max_age_days = 90) {
     age <- as.numeric(Sys.Date() - as.Date(.PRICES_SNAPSHOT_DATE))
     age > max_age_days
 }
-

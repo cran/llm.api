@@ -43,6 +43,95 @@
     list(list(type = "text", text = system_msg, cache_control = control))
 }
 
+# Anthropic authorizes a Claude subscription (OAuth) request only when the
+# first system block is the Claude Code identity; without it the Messages API
+# rejects the call (a 429 with no useful body). Send it verbatim.
+.anthropic_claude_code_identity <-
+    "You are Claude Code, Anthropic's official CLI for Claude."
+
+# Build the Anthropic `system` field. On the subscription-OAuth path the
+# Claude Code identity is prepended as the first block (even when the caller
+# supplies no system prompt), and the caller's system, if any, follows. The
+# API-key path is unchanged: a plain string, or a single cached block.
+.anthropic_system <- function(system_msg, cache, oauth = FALSE) {
+    has_user <- !is.null(system_msg) && nzchar(system_msg)
+    if (!isTRUE(oauth)) {
+        if (!has_user) {
+            return(NULL)
+        }
+        return(.anthropic_system_with_cache(system_msg, cache))
+    }
+    blocks <- list(list(type = "text",
+                        text = .anthropic_claude_code_identity))
+    if (has_user) {
+        blocks <- c(blocks, list(list(type = "text", text = system_msg)))
+    }
+    if (!identical(cache, "none")) {
+        control <- if (identical(cache, "1h")) {
+            list(type = "ephemeral", ttl = "1h")
+        } else {
+            list(type = "ephemeral")
+        }
+        blocks[[length(blocks)]]$cache_control <- control
+    }
+    blocks
+}
+
+# Providers with provider-native web search wired up. Grows as each provider's
+# native mechanism is added (openai_codex/openai Responses tool, anthropic
+# web_search_<date>, moonshot $web_search).
+.web_search_providers <- function() {
+    c("openai_codex", "openai", "anthropic", "anthropic_claude", "moonshot")
+}
+
+# Anthropic server-side web search tool from the provider-neutral toggle, or
+# NULL when off. Uses the basic web_search_20250305 variant: it works across all
+# models (no model->version mapping) and returns clean per-text-block url
+# citations, unlike the dynamic-filtering 20260209 variant (which also pulls in
+# code execution). Supports the full option set.
+.anthropic_web_search_tool <- function(ws) {
+    if (is.null(ws) || isFALSE(ws)) {
+        return(NULL)
+    }
+    tool <- list(type = "web_search_20250305", name = "web_search")
+    if (is.list(ws)) {
+        if (!is.null(ws$max_uses)) {
+            tool$max_uses <- as.integer(ws$max_uses)
+        }
+        if (!is.null(ws$allowed_domains)) {
+            tool$allowed_domains <- as.list(ws$allowed_domains)
+        }
+        if (!is.null(ws$blocked_domains)) {
+            tool$blocked_domains <- as.list(ws$blocked_domains)
+        }
+        if (!is.null(ws$user_location)) {
+            tool$user_location <- ws$user_location
+        }
+    }
+    tool
+}
+
+# Extract web-search citations and search queries from a list of Anthropic
+# content blocks (parsed with simplifyVector = FALSE). Citations live on text
+# blocks; the search query lives on the server_tool_use block.
+.anthropic_search_blocks <- function(content) {
+    citations <- list()
+    searches <- list()
+    for (b in content %||% list()) {
+        if (identical(b$type, "text")) {
+            for (cit in b$citations %||% list()) {
+                citations[[length(citations) + 1L]] <- list(url = cit$url,
+                    title = cit$title)
+            }
+        } else if (identical(b$type, "server_tool_use") &&
+            identical(b$name, "web_search")) {
+            searches[[length(searches) + 1L]] <- list(
+                query = b$input$query, status = "completed")
+        }
+    }
+    list(citations = citations, searches = searches)
+}
+
 #' Chat with an LLM
 #'
 #' Send a message to a Large Language Model and get a response.
@@ -53,8 +142,8 @@
 #' @param history List or NULL. Previous conversation turns.
 #' @param temperature Numeric or NULL. Sampling temperature (0-2).
 #' @param max_tokens Integer or NULL. Maximum tokens in response.
-#' @param provider Character. Provider: "auto", "openai", "anthropic",
-#'   "moonshot", or "ollama".
+#' @param provider Character. Provider: "auto", "openai", "anthropic", "anthropic_claude",
+#'   "moonshot", "openai_codex", or "ollama".
 #' @param stream Logical. Stream the response (prints as it arrives).
 #' @param cache Character. Anthropic prompt caching for the system
 #'   message: \code{"none"} (default), \code{"5m"}, or \code{"1h"}
@@ -64,6 +153,20 @@
 #'   thinking budget; must be at least 1024 and less than
 #'   \code{max_tokens}. Anthropic-only; ignored with a warning for
 #'   other providers.
+#' @param web_search Enable provider-native (server-side) web search:
+#'   \code{FALSE} (default), \code{TRUE}, or a list of options
+#'   (\code{allowed_domains}, \code{user_location}). The model searches
+#'   on its own when useful; the result carries \code{citations} and
+#'   \code{searches}. Wired for \code{"openai_codex"} and \code{"openai"}
+#'   (OpenAI Responses \code{web_search} tool), \code{"anthropic"} and
+#'   \code{"anthropic_claude"} (Messages \code{web_search}), and
+#'   \code{"moonshot"} (the
+#'   \code{$web_search} builtin); ignored with a warning for other
+#'   providers. For \code{"openai"}, the request is routed through the
+#'   Responses endpoint so search works on the default model. Moonshot
+#'   doesn't expose the query or structured citations, so its
+#'   \code{searches} carry \code{query = NA} and \code{citations} is
+#'   empty (citations are inlined in the answer text).
 #' @param ... Additional parameters passed to the API.
 #'
 #' @return A list with:
@@ -99,9 +202,10 @@
 #' }
 chat <- function(prompt, model = NULL, system = NULL, history = NULL,
                  temperature = NULL, max_tokens = NULL,
-                 provider = c("auto", "openai", "anthropic", "moonshot", "ollama"),
+                 provider = c("auto", "openai", "anthropic", "anthropic_claude",
+                              "moonshot", "openai_codex", "ollama"),
                  stream = FALSE, cache = c("none", "5m", "1h"),
-                 thinking_budget_tokens = NULL, ...) {
+                 thinking_budget_tokens = NULL, web_search = FALSE, ...) {
     provider <- match.arg(provider)
     cache <- match.arg(cache)
 
@@ -122,15 +226,22 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
     # Anthropic-only feature opt-ins emit a one-time warning when a
     # non-default value is passed against another provider so the
     # caller knows the request will be silently degraded.
-    if (!identical(cache, "none") && !identical(provider, "anthropic")) {
+    if (!identical(cache, "none") && !.is_anthropic(provider)) {
         warning("`cache` is Anthropic-only; ignoring for provider \"",
                 provider, "\".", call. = FALSE)
         cache <- "none"
     }
-    if (!is.null(thinking_budget_tokens) && !identical(provider, "anthropic")) {
+    if (!is.null(thinking_budget_tokens) && !.is_anthropic(provider)) {
         warning("`thinking_budget_tokens` is Anthropic-only; ignoring ",
                 "for provider \"", provider, "\".", call. = FALSE)
         thinking_budget_tokens <- NULL
+    }
+    # Provider-native web search. Currently wired for openai_codex; other
+    # providers are added incrementally (each has its own native mechanism).
+    if (!isFALSE(web_search) && !provider %in% .web_search_providers()) {
+        warning("`web_search` is not yet supported for provider \"", provider,
+                "\"; ignoring.", call. = FALSE)
+        web_search <- FALSE
     }
 
     # Get provider config
@@ -165,6 +276,10 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
         body$max_tokens <- max_tokens
     }
 
+    if (!isFALSE(web_search)) {
+        body$web_search <- web_search
+    }
+
     # Add extra params
 
     extra <- list(...)
@@ -173,10 +288,20 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
     }
 
     # Make request
-    if (provider == "anthropic") {
+    if (.is_anthropic(provider)) {
         result <- .chat_anthropic(body, config, stream,
                                   cache = cache,
                                   thinking_budget_tokens = thinking_budget_tokens)
+    } else if (provider == "openai_codex") {
+        result <- .chat_openai_codex(body, config, stream)
+    } else if (provider == "openai" && !isFALSE(web_search)) {
+        # Server-side web search needs the Responses endpoint; the
+        # chat-completions path can't run it on the default models.
+        result <- .chat_openai_responses(body, config, stream)
+    } else if (provider == "moonshot" && !isFALSE(web_search)) {
+        # Moonshot's $web_search builtin round-trips through tool calls;
+        # drive that echo loop internally.
+        result <- .chat_moonshot_websearch(body, config, stream)
     } else {
         result <- .chat_openai_compatible(body, config, stream)
     }
@@ -196,6 +321,8 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
          finish_reason = result$finish_reason,
          model = model,
          usage = usage,
+         citations = result$citations,
+         searches = result$searches,
          history = new_history
     )
 }
@@ -302,8 +429,10 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
     anthropic_body <- list(model = body$model, messages = messages,
                            max_tokens = body$max_tokens %||% 4096)
 
-    if (!is.null(system_msg)) {
-        anthropic_body$system <- .anthropic_system_with_cache(system_msg, cache)
+    sys <- .anthropic_system(system_msg, cache,
+                             oauth = is.function(config$credentials))
+    if (!is.null(sys)) {
+        anthropic_body$system <- sys
     }
 
     if (!is.null(body$temperature)) {
@@ -317,11 +446,12 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
         )
     }
 
-    headers <- c(
-                 "Content-Type" = "application/json",
-                 "x-api-key" = config$api_key,
-                 "anthropic-version" = "2023-06-01"
-    )
+    ws_tool <- .anthropic_web_search_tool(body$web_search)
+    if (!is.null(ws_tool)) {
+        anthropic_body$tools <- list(ws_tool)
+    }
+
+    headers <- .anthropic_headers(config)
 
     h <- curl::new_handle()
     curl::handle_setopt(h,
@@ -333,12 +463,16 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
     resp <- curl::curl_fetch_memory(url, handle = h)
 
     if (resp$status_code >= 400) {
-        err <- tryCatch(
-                        jsonlite::fromJSON(rawToChar(resp$content)),
-                        error = function(e) list(error = list(message = rawToChar(resp$content)))
-        )
-        stop("API error (", resp$status_code, "): ",
-             err$error$message %||% "Unknown error", call. = FALSE)
+        raw <- rawToChar(resp$content)
+        err <- tryCatch(jsonlite::fromJSON(raw), error = function(e) NULL)
+        detail <- err$error$message %||% err$message %||% trimws(raw)
+        if (!nzchar(detail)) {
+            detail <- "no error body"
+        }
+        etype <- err$error$type %||% err$type
+        stop("API error (", resp$status_code,
+             if (!is.null(etype) && nzchar(etype)) paste0(" ", etype) else "",
+             "): ", detail, call. = FALSE)
     }
 
     data <- jsonlite::fromJSON(rawToChar(resp$content))
@@ -372,11 +506,23 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
 
     .warn_if_truncated(content, thinking, finish_reason)
 
+    # Web-search citations/queries need the block-level structure, so re-parse
+    # the content as a list (the data.frame parse above flattens nested arrays).
+    search_info <- if (isFALSE(body$web_search %||% FALSE)) {
+        list(citations = list(), searches = list())
+    } else {
+        blocks <- jsonlite::fromJSON(rawToChar(resp$content),
+                                     simplifyVector = FALSE)$content
+        .anthropic_search_blocks(blocks)
+    }
+
     list(
          content = content,
          thinking = thinking,
          finish_reason = finish_reason,
-         usage = data$usage
+         usage = data$usage,
+         citations = search_info$citations,
+         searches = search_info$searches
     )
 }
 
@@ -461,4 +607,3 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
 } else {
     x
 }
-

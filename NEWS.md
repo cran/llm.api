@@ -1,3 +1,89 @@
+# llm.api 0.1.7
+
+CRAN release consolidating the 0.1.5–0.1.6.1 development cycle (none of
+which were on CRAN). Highlights since the on-CRAN 0.1.4:
+
+* `openai_codex` provider for ChatGPT-subscription-backed Codex, with
+  device login / token refresh / caching via tinyoauth (0.1.5).
+* `anthropic_claude` provider: drive 'Claude' on a 'Claude' subscription
+  via OAuth, no API key. Plus provider-native web search across all four
+  hosted providers (0.1.6).
+* A read-only per-call context snapshot passed to context-aware
+  `tool_handler`s, fully backwards compatible (0.1.6.1).
+
+The per-cycle detail follows.
+
+# llm.api 0.1.6.1
+
+## New features
+
+* `agent()` now passes a read-only per-call **context** snapshot (by name) to a
+  `tool_handler` that declares a `context` formal: `assistant_text` (the model's
+  text for the turn), `agent_turn`, `call_index`, `call_count`, and `provider`.
+  `call_index`/`call_count` count over calls actually dispatched to the handler
+  (excluding internally-consumed ones like Moonshot web search). Two-argument
+  handlers are called exactly as before, so this is fully backward compatible
+  and needs no provider parser changes. Lets a caller surface the model's own
+  rationale at tool-approval time or detect tool-call streaks with no narration.
+
+# llm.api 0.1.6
+
+* New `anthropic_claude` provider: drive Claude on a Claude subscription via
+  OAuth (no API key), mirroring the `openai_codex` provider. Adds
+  `chat_claude_oauth()`, `claude_oauth_login()`, and
+  `anthropic_claude_credentials()`, plus `provider = "anthropic_claude"` for
+  `chat()`, `agent()`, and `chat_session()`. Login, token caching, and refresh
+  run through tinyoauth's Claude route (new in tinyoauth 0.1.1); the Messages
+  API request path, prompt caching, thinking, tool use, usage parsing, and cost
+  are shared with the API-key `anthropic` provider.
+
+* Provider-native web search: a `web_search` argument on `chat()` and `agent()`
+  (FALSE | TRUE | a list of options). When on, the model runs server-side web
+  search and the result carries `citations` and `searches`. Wired for all four
+  hosted providers:
+  - `openai_codex` and `openai` via the OpenAI Responses `web_search` tool. For
+    `openai`, the request is routed through the Responses endpoint so search
+    works on the default model (the chat-completions path needs a dedicated
+    `-search-preview` model).
+  - `anthropic` via the Messages `web_search_20250305` tool.
+  - `moonshot` via the `$web_search` builtin. Moonshot round-trips the search
+    through the tool-call protocol; `llm.api` drives that echo loop internally
+    so it stays a single `chat()` / `agent()` call. Moonshot doesn't expose the
+    query (so `searches` records that a search ran, with `query = NA`) and
+    inlines citations as markdown links in the answer (so `citations` is empty).
+
+  Search is server-side, so it is not gated by `tool_handler`.
+
+# llm.api 0.1.5
+
+* First release of the `openai_codex` provider for ChatGPT-subscription-backed
+  Codex (OpenAI Responses API): `chat_openai_codex()`, `agent(provider =
+  "openai_codex")`, `openai_codex_credentials()`, and `openai_codex_login()`,
+  with device login / token refresh / caching via tinyoauth. Consolidates the
+  0.1.4.1-0.1.4.4 development cycle (the per-cycle detail follows).
+
+# llm.api 0.1.4.4
+
+* Fix a 400 from the `openai_codex` provider when `max_tokens` is passed (e.g.
+  via `agent()` or `chat()`). The ChatGPT Codex backend rejects both `max_tokens`
+  and `max_output_tokens`, so they are now dropped before the request rather than
+  forwarded. Since `max_tokens` is a documented argument that Codex can't honor,
+  a warning is emitted once per session when a token cap is supplied.
+
+# llm.api 0.1.4.2
+
+* `openai_codex_login()` now returns its credentials callback invisibly (it was
+  echoing the whole function body to the console) and prints a confirmation
+  with the logged-in account id.
+
+# llm.api 0.1.4.1
+
+* New `openai_codex` provider for ChatGPT subscription-backed OpenAI Codex
+  Responses calls: `chat_openai_codex()`, `agent(provider = "openai_codex")`,
+  `openai_codex_credentials()`, and `openai_codex_login()`. Device login,
+  token refresh, and on-disk caching are handled by
+  [tinyoauth](https://github.com/cornball-ai/tinyoauth).
+
 # llm.api 0.1.4
 
 CRAN release consolidating the 0.1.3.1–0.1.3.5 development cycle.

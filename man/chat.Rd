@@ -5,9 +5,10 @@
 \usage{
 chat(prompt, model = NULL, system = NULL, history = NULL, temperature = NULL,
      max_tokens = NULL,
-     provider = c("auto", "openai", "anthropic", "moonshot", "ollama"),
+     provider = c("auto", "openai", "anthropic", "anthropic_claude",
+                  "moonshot", "openai_codex", "ollama"),
      stream = FALSE, cache = c("none", "5m", "1h"),
-     thinking_budget_tokens = NULL, ...)
+     thinking_budget_tokens = NULL, web_search = FALSE, ...)
 }
 \arguments{
 \item{prompt}{Character. The user message to send.}
@@ -22,8 +23,8 @@ chat(prompt, model = NULL, system = NULL, history = NULL, temperature = NULL,
 
 \item{max_tokens}{Integer or NULL. Maximum tokens in response.}
 
-\item{provider}{Character. Provider: "auto", "openai", "anthropic",
-"moonshot", or "ollama".}
+\item{provider}{Character. Provider: "auto", "openai", "anthropic", "anthropic_claude",
+"moonshot", "openai_codex", or "ollama".}
 
 \item{stream}{Logical. Stream the response (prints as it arrives).}
 
@@ -36,6 +37,21 @@ for other providers.}
 thinking budget; must be at least 1024 and less than
 \code{max_tokens}. Anthropic-only; ignored with a warning for
 other providers.}
+
+\item{web_search}{Enable provider-native (server-side) web search:
+\code{FALSE} (default), \code{TRUE}, or a list of options
+(\code{allowed_domains}, \code{user_location}). The model searches
+on its own when useful; the result carries \code{citations} and
+\code{searches}. Wired for \code{"openai_codex"} and \code{"openai"}
+(OpenAI Responses \code{web_search} tool), \code{"anthropic"} and
+\code{"anthropic_claude"} (Messages \code{web_search}), and
+\code{"moonshot"} (the
+\code{$web_search} builtin); ignored with a warning for other
+providers. For \code{"openai"}, the request is routed through the
+Responses endpoint so search works on the default model. Moonshot
+doesn't expose the query or structured citations, so its
+\code{searches} carry \code{query = NA} and \code{citations} is
+empty (citations are inlined in the answer text).}
 
 \item{...}{Additional parameters passed to the API.}
 }
