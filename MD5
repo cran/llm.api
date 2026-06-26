@@ -1,8 +1,8 @@
-125224ed1ceb5f9f1a0ff1d63c9ec6a5 *DESCRIPTION
+021b017ca7946b468156981201d9631e *DESCRIPTION
 b6ac9cf50e625263e8129ba0f1baa631 *LICENSE
 e81c11399aee13ac7f9d6dc7acf4382f *NAMESPACE
-d671159e82047daae532f8751a387ff8 *NEWS.md
-5c8b786ecbebfa4dce4793f4630f16f7 *R/agent.R
+a114fe9fc76a48769f581c96104389b0 *NEWS.md
+be3201117fd581e4d9a31674a7085e6a *R/agent.R
 a2c47cbad7d8cf7a77eb3d29f5a64741 *R/anthropic-claude.R
 506e5c7932ea59601e4609c2cb2b3a6a *R/chat.R
 ddd495eccd2ee2f3bd8bafc68dd99a74 *R/config.R
@@ -19,7 +19,7 @@ ba7243faa53c51141fd874acb675b51f *R/providers.R
 402966038975d72f3d00a7c6ad2ffba0 *inst/tinytest/test_agent_extensions.R
 1d25b49fb8c0ebe75f184dc7af04215c *inst/tinytest/test_agent_history_callback.R
 f13ff2cefb5af06b867d98955b1c2d18 *inst/tinytest/test_agent_ollama_id_writeback.R
-cbcce2e4f6a628b2fc60b1492a96d461 *inst/tinytest/test_agent_tool_context.R
+1e593f99fb7c5788bfba48e175333b56 *inst/tinytest/test_agent_tool_context.R
 8b7a831f539e604d0d21b2265d57cf3b *inst/tinytest/test_anthropic_claude.R
 bae27e8b9498f47af56bcbc07fea6aea *inst/tinytest/test_anthropic_web_search.R
 dcdf8162aa2206c4856bd5dedaf05e48 *inst/tinytest/test_config.R
