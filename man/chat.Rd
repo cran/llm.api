@@ -3,17 +3,29 @@
 \alias{chat}
 \title{Chat with an LLM}
 \usage{
-chat(prompt, model = NULL, system = NULL, history = NULL, temperature = NULL,
-     max_tokens = NULL,
-     provider = c("auto", "openai", "anthropic", "anthropic_claude",
-                  "moonshot", "openai_codex", "ollama", "openai_compatible"),
-     stream = FALSE, cache = c("none", "5m", "1h"),
-     thinking_budget_tokens = NULL, web_search = FALSE, ...)
+chat(
+  prompt,
+  model = NULL,
+  system = NULL,
+  history = NULL,
+  temperature = NULL,
+  max_tokens = NULL,
+  provider = c("auto", "openai", "anthropic", "anthropic_claude", "moonshot", "google",
+    "openai_codex", "ollama", "openai_compatible"),
+  stream = FALSE,
+  cache = c("none", "5m", "1h"),
+  thinking_budget_tokens = NULL,
+  web_search = FALSE,
+  thinking = NULL,
+  request_callback = NULL,
+  ...
+)
 }
 \arguments{
 \item{prompt}{Character. The user message to send.}
 
-\item{model}{Character. Model name (e.g., "gpt-5.4-mini", "claude-sonnet-4-6", "qwen3.5:9b").}
+\item{model}{Character. Model name (e.g., "gpt-6.1-sol", "claude-opus-5-5",
+"gemini-3.5-flash", "qwen3.5:9b").}
 
 \item{system}{Character or NULL. System prompt to set context.}
 
@@ -24,17 +36,21 @@ chat(prompt, model = NULL, system = NULL, history = NULL, temperature = NULL,
 \item{max_tokens}{Integer or NULL. Maximum tokens in response.}
 
 \item{provider}{Character. Provider: "auto", "openai", "anthropic", "anthropic_claude",
-"moonshot", "openai_codex", "ollama", or "openai_compatible" (a
+"moonshot", "google" (Gemini through Google's OpenAI-compatible
+endpoint), "openai_codex", "ollama", or "openai_compatible" (a
 generic OpenAI-compatible gateway such as OpenRouter, DeepSeek, or
 a corporate proxy; requires a base URL via \code{llm_base()} or
 \code{OPENAI_COMPATIBLE_BASE_URL}, and an explicit \code{model}).}
 
 \item{stream}{Logical. Stream the response (prints as it arrives).}
 
-\item{cache}{Character. Anthropic prompt caching for the system
-message: \code{"none"} (default), \code{"5m"}, or \code{"1h"}
-ephemeral TTL. Anthropic-only; warns and degrades to \code{"none"}
-for other providers.}
+\item{cache}{Character. Anthropic prompt caching: \code{"none"}
+(default), \code{"5m"}, or \code{"1h"} ephemeral TTL. Places a
+marker on the system message and another on the final message, so
+a follow-up call that resends this conversation reads it from
+cache. Billing-only: the model receives identical input either
+way. Anthropic-only; warns and degrades to \code{"none"} for other
+providers.}
 
 \item{thinking_budget_tokens}{Integer or NULL. Anthropic extended
 thinking budget; must be at least 1024 and less than
@@ -55,6 +71,21 @@ Responses endpoint so search works on the default model. Moonshot
 doesn't expose the query or structured citations, so its
 \code{searches} carry \code{query = NA} and \code{citations} is
 empty (citations are inlined in the answer text).}
+
+\item{thinking}{Character, list, or NULL. The Anthropic
+\code{thinking} request field, for models where a budget is not the
+control: a type name such as \code{"adaptive"}, \code{"disabled"},
+or \code{"between_tools"}, or the field itself as a list, e.g.
+\code{list(type = "adaptive", display = "summarized")}. Sent as
+given; which types a model accepts is the provider's rule (Claude
+Sonnet 5.5 answers without thinking first under
+\code{"between_tools"} and refuses \code{"disabled"}). Cannot be
+combined with \code{thinking_budget_tokens}. Anthropic-only;
+ignored with a warning for other providers.}
+
+\item{request_callback}{Optional request observer, with the same event
+contract as [agent()]. Receives the final serialized request body without
+authentication headers and per-attempt completion, usage and error metadata.}
 
 \item{...}{Additional parameters passed to the API.}
 }

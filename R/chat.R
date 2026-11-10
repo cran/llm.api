@@ -31,6 +31,43 @@
 # Wrap the system message in a cache_control block when caching is
 # requested, or pass it through as plain text when cache == "none".
 # The "5m" and "1h" values map to Anthropic's ephemeral cache TTLs.
+# Normalize the `thinking` argument to the Anthropic body field, or NULL.
+#
+# A string is the type alone; a list is the field as it will be sent.
+# Nothing is checked against a table of types: which ones a model
+# accepts is the provider's rule and it changes by model (Claude Sonnet
+# 5.5 takes "between_tools" and refuses "disabled", Claude Sonnet 5 the
+# reverse), and its 400 names the fix. `[[`, not `$`, so a list holding
+# only `type_hint` or similar is not read as having a `type`.
+.validate_thinking <- function(thinking) {
+    if (is.null(thinking)) {
+        return(NULL)
+    }
+    if (is.character(thinking) && length(thinking) == 1L &&
+        !is.na(thinking) && nzchar(thinking)) {
+        return(list(type = thinking))
+    }
+    type <- if (is.list(thinking)) {
+        thinking[["type"]]
+    }
+    if (!is.character(type) || length(type) != 1L || is.na(type) ||
+        !nzchar(type)) {
+        stop("`thinking` must be a thinking type such as \"adaptive\", ",
+             "or a list with a `type`.", call. = FALSE)
+    }
+    thinking
+}
+
+# `thinking` and `thinking_budget_tokens` each produce the whole
+# `thinking` body field, so a call naming both has no single meaning.
+.check_thinking_exclusive <- function(thinking, thinking_budget_tokens) {
+    if (!is.null(thinking) && !is.null(thinking_budget_tokens)) {
+        stop("Pass `thinking` or `thinking_budget_tokens`, not both: ",
+             "each sets the request's `thinking` field.", call. = FALSE)
+    }
+    invisible(TRUE)
+}
+
 .anthropic_system_with_cache <- function(system_msg, cache) {
     if (identical(cache, "none")) {
         return(system_msg)
@@ -76,6 +113,77 @@
     blocks
 }
 
+# Put a cache_control marker on the tail of the message history, so the
+# next request reads this one's context from cache instead of paying
+# for it again.
+#
+# Anthropic caches tools + system + messages up to a marked block. With
+# the marker on system alone, only the static prefix is ever read back;
+# in an agent loop that is a few thousand tokens against a history that
+# grows every iteration and is re-sent whole each time. On the corteza
+# ARC harness one game re-sent a history that reached ~429k tokens
+# across 239 requests: 59.4M uncached input tokens, of which the system
+# marker would have covered about 0.5%.
+#
+# Marking the final block instead means request N writes the whole
+# conversation so far, and request N+1 -- whose prefix is N's messages
+# plus the new assistant turn and tool results -- looks back, finds N's
+# entry, and pays fresh input only for the appended blocks. Anthropic
+# documents this as the intended pattern for multi-turn use. The
+# lookback is bounded at 20 positions, where a run of consecutive
+# tool_use blocks counts as one and a run of tool_result blocks as one;
+# an agent iteration appends two, so the previous entry is always in
+# reach. A single request that appends more than 20 positions of other
+# content would miss and rewrite the whole prefix; that is the one case
+# this does not cover, and usage$cache_creation_input_tokens near the
+# full conversation size on every request is its signature.
+#
+# Applied to the translated copy at request-build time, never to the
+# caller's accumulating history, and it strips any marker already
+# present before placing one -- so a history that was marked on a
+# previous request carries exactly one marker into the next, rather
+# than one per iteration until the four-breakpoint limit 400s. Same TTL
+# as the system marker, so Anthropic's rule that a longer-TTL breakpoint
+# precede a shorter one never engages. "none" returns the input as is:
+# byte-identical serialization is what a test on that path checks.
+.anthropic_mark_history <- function(messages, cache) {
+    if (identical(cache, "none") || !length(messages)) {
+        return(messages)
+    }
+    control <- if (identical(cache, "1h")) {
+        list(type = "ephemeral", ttl = "1h")
+    } else {
+        list(type = "ephemeral")
+    }
+    messages <- lapply(messages, function(m) {
+        if (is.list(m$content)) {
+            m$content <- lapply(m$content, function(b) {
+                b$cache_control <- NULL
+                b
+            })
+        }
+        m
+    })
+    last <- length(messages)
+    content <- messages[[last]]$content
+    if (is.character(content)) {
+        messages[[last]]$content <- list(list(type = "text", text = content,
+                cache_control = control))
+        return(messages)
+    }
+    # Walk back past anything a marker cannot sit on. thinking blocks
+    # are the only such type a history can end in.
+    i <- length(content)
+    while (i >= 1L &&
+        isTRUE(content[[i]]$type %in% c("thinking", "redacted_thinking"))) {
+        i <- i - 1L
+    }
+    if (i >= 1L) {
+        messages[[last]]$content[[i]]$cache_control <- control
+    }
+    messages
+}
+
 # Providers with provider-native web search wired up. Grows as each provider's
 # native mechanism is added (openai_codex/openai Responses tool, anthropic
 # web_search_<date>, moonshot $web_search).
@@ -110,6 +218,40 @@
     tool
 }
 
+# The reply text of an Anthropic response, from its content blocks:
+# `types` is each block's type in order, `texts` its text (NA where the
+# block has none).
+#
+# Consecutive text blocks are pieces of one passage, not separate lines.
+# With web search the API cuts the reply at every citation boundary, in
+# the middle of a sentence, so the pieces are joined with nothing
+# between them. Joined with a newline, as this used to do, a cited
+# answer came out with "." and ", with the ..." stranded on lines of
+# their own. A text block that follows any other kind of block (a
+# search, a tool call, thinking) starts a new paragraph.
+.anthropic_join_text <- function(types, texts) {
+    out <- ""
+    started <- FALSE
+    after_text <- FALSE
+    for (i in seq_along(types)) {
+        if (!identical(types[[i]], "text")) {
+            after_text <- FALSE
+            next
+        }
+        piece <- texts[[i]]
+        if (is.na(piece)) {
+            piece <- ""
+        }
+        if (started && !after_text) {
+            out <- paste0(sub("\n+$", "", out), "\n\n")
+        }
+        out <- paste0(out, piece)
+        started <- TRUE
+        after_text <- TRUE
+    }
+    out
+}
+
 # Extract web-search citations and search queries from a list of Anthropic
 # content blocks (parsed with simplifyVector = FALSE). Citations live on text
 # blocks; the search query lives on the server_tool_use block.
@@ -136,21 +278,26 @@
 #' Send a message to a Large Language Model and get a response.
 #'
 #' @param prompt Character. The user message to send.
-#' @param model Character. Model name (e.g., "gpt-5.4-mini", "claude-sonnet-4-6", "qwen3.5:9b").
+#' @param model Character. Model name (e.g., "gpt-6.1-sol", "claude-opus-5-5",
+#'   "gemini-3.5-flash", "qwen3.5:9b").
 #' @param system Character or NULL. System prompt to set context.
 #' @param history List or NULL. Previous conversation turns.
 #' @param temperature Numeric or NULL. Sampling temperature (0-2).
 #' @param max_tokens Integer or NULL. Maximum tokens in response.
 #' @param provider Character. Provider: "auto", "openai", "anthropic", "anthropic_claude",
-#'   "moonshot", "openai_codex", "ollama", or "openai_compatible" (a
+#'   "moonshot", "google" (Gemini through Google's OpenAI-compatible
+#'   endpoint), "openai_codex", "ollama", or "openai_compatible" (a
 #'   generic OpenAI-compatible gateway such as OpenRouter, DeepSeek, or
 #'   a corporate proxy; requires a base URL via \code{llm_base()} or
 #'   \code{OPENAI_COMPATIBLE_BASE_URL}, and an explicit \code{model}).
 #' @param stream Logical. Stream the response (prints as it arrives).
-#' @param cache Character. Anthropic prompt caching for the system
-#'   message: \code{"none"} (default), \code{"5m"}, or \code{"1h"}
-#'   ephemeral TTL. Anthropic-only; warns and degrades to \code{"none"}
-#'   for other providers.
+#' @param cache Character. Anthropic prompt caching: \code{"none"}
+#'   (default), \code{"5m"}, or \code{"1h"} ephemeral TTL. Places a
+#'   marker on the system message and another on the final message, so
+#'   a follow-up call that resends this conversation reads it from
+#'   cache. Billing-only: the model receives identical input either
+#'   way. Anthropic-only; warns and degrades to \code{"none"} for other
+#'   providers.
 #' @param thinking_budget_tokens Integer or NULL. Anthropic extended
 #'   thinking budget; must be at least 1024 and less than
 #'   \code{max_tokens}. Anthropic-only; ignored with a warning for
@@ -169,6 +316,16 @@
 #'   doesn't expose the query or structured citations, so its
 #'   \code{searches} carry \code{query = NA} and \code{citations} is
 #'   empty (citations are inlined in the answer text).
+#' @param thinking Character, list, or NULL. The Anthropic
+#'   \code{thinking} request field, for models where a budget is not the
+#'   control: a type name such as \code{"adaptive"}, \code{"disabled"},
+#'   or \code{"between_tools"}, or the field itself as a list, e.g.
+#'   \code{list(type = "adaptive", display = "summarized")}. Sent as
+#'   given; which types a model accepts is the provider's rule (Claude
+#'   Sonnet 5.5 answers without thinking first under
+#'   \code{"between_tools"} and refuses \code{"disabled"}). Cannot be
+#'   combined with \code{thinking_budget_tokens}. Anthropic-only;
+#'   ignored with a warning for other providers.
 #' @param ... Additional parameters passed to the API.
 #'
 #' @return A list with:
@@ -202,12 +359,17 @@
 #' result <- chat("Hello")
 #' chat("Tell me more", history = result$history)
 #' }
+#' @param request_callback Optional request observer, with the same event
+#'   contract as [agent()]. Receives the final serialized request body without
+#'   authentication headers and per-attempt completion, usage and error metadata.
 chat <- function(prompt, model = NULL, system = NULL, history = NULL,
                  temperature = NULL, max_tokens = NULL,
                  provider = c("auto", "openai", "anthropic", "anthropic_claude",
-                              "moonshot", "openai_codex", "ollama", "openai_compatible"),
+                              "moonshot", "google", "openai_codex", "ollama",
+                              "openai_compatible"),
                  stream = FALSE, cache = c("none", "5m", "1h"),
-                 thinking_budget_tokens = NULL, web_search = FALSE, ...) {
+                 thinking_budget_tokens = NULL, web_search = FALSE,
+                 thinking = NULL, request_callback = NULL, ...) {
     provider <- match.arg(provider)
     cache <- match.arg(cache)
 
@@ -217,6 +379,8 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
     if (!is.null(thinking_budget_tokens)) {
         .validate_thinking_budget(thinking_budget_tokens, max_tokens)
     }
+    thinking <- .validate_thinking(thinking)
+    .check_thinking_exclusive(thinking, thinking_budget_tokens)
 
     # Resolve "auto" to a concrete provider before the Anthropic-only
     # guards below, otherwise they compare against "auto" and wrongly
@@ -224,6 +388,8 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
     if (provider == "auto") {
         provider <- .detect_provider(model)
     }
+    previous_request <- .request_enter(request_callback, provider)
+    on.exit(.request_runtime$current <- previous_request, add = TRUE)
 
     # Anthropic-only feature opt-ins emit a one-time warning when a
     # non-default value is passed against another provider so the
@@ -237,6 +403,11 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
         warning("`thinking_budget_tokens` is Anthropic-only; ignoring ",
                 "for provider \"", provider, "\".", call. = FALSE)
         thinking_budget_tokens <- NULL
+    }
+    if (!is.null(thinking) && !.is_anthropic(provider)) {
+        warning("`thinking` is Anthropic-only; ignoring for provider \"",
+                provider, "\".", call. = FALSE)
+        thinking <- NULL
     }
     # Provider-native web search. Currently wired for openai_codex; other
     # providers are added incrementally (each has its own native mechanism).
@@ -294,7 +465,8 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
     if (.is_anthropic(provider)) {
         result <- .chat_anthropic(body, config, stream,
                                   cache = cache,
-                                  thinking_budget_tokens = thinking_budget_tokens)
+                                  thinking_budget_tokens = thinking_budget_tokens,
+                                  thinking = thinking)
     } else if (provider == "openai_codex") {
         result <- .chat_openai_codex(body, config, stream)
     } else if (provider == "openai" && !isFALSE(web_search)) {
@@ -348,6 +520,7 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
 #' @noRd
 .chat_openai_compatible <- function(body, config, stream) {
     url <- paste0(config$base_url, config$chat_path)
+    body$messages <- .llm_blocks(body$messages, "openai")
 
     # OpenAI deprecated max_tokens in favor of max_completion_tokens
     # and reasoning (o-series) models reject max_tokens entirely. Map
@@ -366,15 +539,21 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
         headers["Authorization"] <- paste("Bearer", config$api_key)
     }
 
+    # Streaming builds its own request: the SSE reader needs a body with
+    # stream = TRUE in it, which this one does not have.
+    if (stream) {
+        return(.stream_response(url, body, headers))
+    }
+
+    payload <- jsonlite::toJSON(body, auto_unbox = TRUE)
+    request <- .request_new(payload, "chat_completions", body$model)
     h <- curl::new_handle()
-    curl::handle_setopt(h, customrequest = "POST",
-                        postfields = jsonlite::toJSON(body, auto_unbox = TRUE))
+    curl::handle_setopt(h, customrequest = "POST", postfields = payload)
     curl::handle_setheaders(h, .list = as.list(headers))
 
-    if (stream) {
-        .stream_response(url, h)
-    } else {
-        resp <- curl::curl_fetch_memory(url, handle = h)
+    {
+        resp <- .request_fetch(request,
+                               curl::curl_fetch_memory(url, handle = h))
 
         if (resp$status_code >= 400) {
             err <- tryCatch(
@@ -413,15 +592,18 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
 
 #' Anthropic chat request
 #' @noRd
-.chat_anthropic <- function(body, config, stream, cache = "none",
-                            thinking_budget_tokens = NULL) {
-    url <- paste0(config$base_url, config$chat_path)
-
+# The request body for the one-shot chat() path, split out of
+# .chat_anthropic() so it can be checked without a network stub: that
+# function posts through a curl handle, and the body set on a handle
+# cannot be read back. Pure over its inputs.
+.anthropic_chat_body <- function(body, cache = "none",
+                                 thinking_budget_tokens = NULL,
+                                 oauth = FALSE, thinking = NULL) {
     # Convert messages format for Anthropic
     system_msg <- NULL
     messages <- list()
 
-    for (msg in body$messages) {
+    for (msg in .llm_blocks(body$messages, "anthropic")) {
         if (msg$role == "system") {
             system_msg <- msg$content
         } else {
@@ -429,11 +611,11 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
         }
     }
 
-    anthropic_body <- list(model = body$model, messages = messages,
+    anthropic_body <- list(model = body$model,
+                           messages = .anthropic_mark_history(messages, cache),
                            max_tokens = body$max_tokens %||% 4096)
 
-    sys <- .anthropic_system(system_msg, cache,
-                             oauth = is.function(config$credentials))
+    sys <- .anthropic_system(system_msg, cache, oauth = oauth)
     if (!is.null(sys)) {
         anthropic_body$system <- sys
     }
@@ -448,58 +630,73 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
                                         budget_tokens = as.integer(thinking_budget_tokens)
         )
     }
+    if (!is.null(thinking)) {
+        anthropic_body$thinking <- thinking
+    }
 
     ws_tool <- .anthropic_web_search_tool(body$web_search)
     if (!is.null(ws_tool)) {
         anthropic_body$tools <- list(ws_tool)
     }
 
+    anthropic_body
+}
+
+.chat_anthropic <- function(body, config, stream, cache = "none",
+                            thinking_budget_tokens = NULL, thinking = NULL) {
+    url <- paste0(config$base_url, config$chat_path)
+
+    anthropic_body <- .anthropic_chat_body(body, cache = cache,
+        thinking_budget_tokens = thinking_budget_tokens,
+        oauth = is.function(config$credentials), thinking = thinking)
+
     headers <- .anthropic_headers(config)
 
-    h <- curl::new_handle()
-    curl::handle_setopt(h,
-                        customrequest = "POST",
-                        postfields = jsonlite::toJSON(anthropic_body, auto_unbox = TRUE)
-    )
-    curl::handle_setheaders(h, .list = as.list(headers))
+    if (isTRUE(stream)) {
+        # The SSE transport the agent loop uses, printing each text
+        # fragment as it arrives. It assembles the non-streamed response
+        # shape, so everything below reads one object either way.
+        data <- .anthropic_post_sse(url, anthropic_body, headers,
+                                    on_delta = function(text) cat(text))
+        cat("\n")
+    } else {
+        payload <- jsonlite::toJSON(anthropic_body, auto_unbox = TRUE)
+        request <- .request_new(payload, "messages", anthropic_body$model)
+        h <- curl::new_handle()
+        curl::handle_setopt(h, customrequest = "POST", postfields = payload)
+        curl::handle_setheaders(h, .list = as.list(headers))
 
-    resp <- curl::curl_fetch_memory(url, handle = h)
+        resp <- .request_fetch(request,
+                               curl::curl_fetch_memory(url, handle = h))
 
-    if (resp$status_code >= 400) {
-        raw <- rawToChar(resp$content)
-        err <- tryCatch(jsonlite::fromJSON(raw), error = function(e) NULL)
-        detail <- err$error$message %||% err$message %||% trimws(raw)
-        if (!nzchar(detail)) {
-            detail <- "no error body"
+        if (resp$status_code >= 400) {
+            raw <- rawToChar(resp$content)
+            err <- tryCatch(jsonlite::fromJSON(raw), error = function(e) NULL)
+            detail <- err$error$message %||% err$message %||% trimws(raw)
+            if (!nzchar(detail)) {
+                detail <- "no error body"
+            }
+            etype <- err$error$type %||% err$type
+            stop("API error (", resp$status_code,
+                if (!is.null(etype) && nzchar(etype)) paste0(" ", etype) else "",
+                 "): ", detail, call. = FALSE)
         }
-        etype <- err$error$type %||% err$type
-        stop("API error (", resp$status_code,
-            if (!is.null(etype) && nzchar(etype)) paste0(" ", etype) else "",
-             "): ", detail, call. = FALSE)
+
+        # Blocks as a list, the shape the SSE transport assembles too.
+        data <- jsonlite::fromJSON(rawToChar(resp$content),
+                                   simplifyVector = FALSE)
     }
 
-    data <- jsonlite::fromJSON(rawToChar(resp$content))
+    # content is an ordered list of blocks; pull text out of "text"
+    # blocks and thinking out of "thinking" blocks.
+    types <- vapply(data$content, function(b) b$type %||% "", character(1))
+    texts <- vapply(data$content, function(b) {
+        as.character(b$text %||% NA_character_)[1L]
+    }, character(1))
+    thinking_blocks <- vapply(data$content[types == "thinking"],
+                              function(b) b$thinking %||% "", character(1))
 
-    # Handle both data.frame and list formats from jsonlite. content is an
-    # ordered list of blocks; pull text out of "text" blocks and thinking
-    # out of "thinking" blocks.
-    if (is.data.frame(data$content)) {
-        types <- data$content$type
-        text_blocks <- data$content$text[types == "text"]
-        thinking_blocks <- data$content$thinking[types == "thinking"]
-    } else {
-        types <- vapply(data$content, function(b) b$type %||% "", character(1))
-        text_blocks <- vapply(data$content[types == "text"],
-                              function(b) b$text %||% "", character(1))
-        thinking_blocks <- vapply(data$content[types == "thinking"],
-                                  function(b) b$thinking %||% "", character(1))
-    }
-
-    if (length(text_blocks)) {
-        content <- paste(text_blocks, collapse = "\n")
-    } else {
-        content <- ""
-    }
+    content <- .anthropic_join_text(types, texts)
     thinking <- if (length(thinking_blocks)) {
         paste(thinking_blocks, collapse = "\n")
     } else {
@@ -509,14 +706,10 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
 
     .warn_if_truncated(content, thinking, finish_reason)
 
-    # Web-search citations/queries need the block-level structure, so re-parse
-    # the content as a list (the data.frame parse above flattens nested arrays).
     search_info <- if (isFALSE(body$web_search %||% FALSE)) {
         list(citations = list(), searches = list())
     } else {
-        blocks <- jsonlite::fromJSON(rawToChar(resp$content),
-                                     simplifyVector = FALSE)$content
-        .anthropic_search_blocks(blocks)
+        .anthropic_search_blocks(data$content)
     }
 
     list(
@@ -555,52 +748,27 @@ chat <- function(prompt, model = NULL, system = NULL, history = NULL,
 }
 
 #' Stream response with live output
+#'
+#' Rebuilt on \code{.openai_cc_post_sse()}. The previous version set
+#' curl's \code{writefunction} option on the handle, which curl 7.x
+#' rejects outright -- "Option writefunction (20011) has unknown or
+#' unsupported type" -- so every \code{chat(stream = TRUE)} call threw
+#' before it reached the network. Nothing caught it because streaming
+#' is only used interactively and no test exercised the function.
+#'
+#' Usage comes back now too, where the old one always reported NULL.
 #' @noRd
-.stream_response <- function(url, handle) {
-    full_content <- ""
-    full_thinking <- ""
-    finish_reason <- NULL
-
-    callback <- function(data) {
-        lines <- strsplit(rawToChar(data), "\n")[[1]]
-        for (line in lines) {
-            if (startsWith(line, "data: ") && line != "data: [DONE]") {
-                json_str <- substring(line, 7)
-                tryCatch({
-                    chunk <- jsonlite::fromJSON(json_str)
-                    choice <- chunk$choices[[1]]
-                    delta <- choice$delta$content
-                    if (!is.null(delta)) {
-                        cat(delta)
-                        full_content <<- paste0(full_content, delta)
-                    }
-                    think_delta <- choice$delta$reasoning_content %||%
-                    choice$delta$reasoning
-                    if (!is.null(think_delta)) {
-                        full_thinking <<- paste0(full_thinking, think_delta)
-                    }
-                    if (!is.null(choice$finish_reason)) {
-                        finish_reason <<- choice$finish_reason
-                    }
-                }, error = function(e) NULL)
-            }
-        }
-        length(data)
-    }
-
-    curl::handle_setopt(handle, writefunction = callback)
-    curl::curl_fetch_memory(url, handle = handle)
+.stream_response <- function(url, body, headers) {
+    resp <- .openai_cc_post_sse(url, body, headers,
+                                on_delta = function(text) cat(text))
     cat("\n")
-
-    if (nzchar(full_thinking)) {
-        thinking <- full_thinking
-    } else {
-        thinking <- NULL
-    }
-    .warn_if_truncated(full_content, thinking, finish_reason)
-
-    list(content = full_content, thinking = thinking,
-         finish_reason = finish_reason, usage = NULL)
+    msg <- resp$choices[[1L]]$message
+    content <- msg$content %||% ""
+    thinking <- msg$reasoning_content
+    finish_reason <- resp$choices[[1L]]$finish_reason
+    .warn_if_truncated(content, thinking, finish_reason)
+    list(content = content, thinking = thinking,
+         finish_reason = finish_reason, usage = resp$usage)
 }
 
 #' Null coalescing operator

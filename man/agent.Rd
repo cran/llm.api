@@ -3,15 +3,32 @@
 \alias{agent}
 \title{Chat with tool use (agentic mode)}
 \usage{
-agent(prompt, tools = list(), tool_handler = NULL, system = NULL, model = NULL,
-      provider = c("anthropic", "anthropic_claude", "openai", "moonshot",
-                   "openai_codex", "ollama", "openai_compatible"),
-      max_turns = 20L, verbose = TRUE, history = NULL, history_callback = NULL,
-      cache = c("none", "5m", "1h"), thinking_budget_tokens = NULL,
-      web_search = FALSE, ...)
+agent(
+  prompt,
+  tools = list(),
+  tool_handler = NULL,
+  system = NULL,
+  model = NULL,
+  provider = c("anthropic", "anthropic_claude", "openai", "moonshot", "google",
+    "openai_codex", "ollama", "openai_compatible"),
+  max_turns = 20L,
+  verbose = TRUE,
+  history = NULL,
+  history_callback = NULL,
+  checkpoint_callback = NULL,
+  cache = c("none", "5m", "1h"),
+  thinking_budget_tokens = NULL,
+  web_search = FALSE,
+  on_delta = NULL,
+  thinking = NULL,
+  request_callback = NULL,
+  ...
+)
 }
 \arguments{
-\item{prompt}{Character. The user message.}
+\item{prompt}{Character or NULL. The user message. NULL continues directly
+from \code{history} without appending another user message; \code{history}
+must then be non-empty.}
 
 \item{tools}{List. Tool definitions (from mcp_tools_for_claude or manual).}
 
@@ -26,10 +43,13 @@ text for this turn), `agent_turn`, `call_index`, `call_count`, and
 \item{model}{Character. Model name.}
 
 \item{provider}{Character. Provider: "anthropic", "anthropic_claude", "openai", "moonshot",
-"openai_codex", "ollama", or "openai_compatible" (a generic
+"google", "openai_codex", "ollama", or "openai_compatible" (a generic
 OpenAI-compatible gateway; requires a base URL via
 \code{llm_base()} or \code{OPENAI_COMPATIBLE_BASE_URL}, and an
-explicit \code{model}).}
+explicit \code{model}).
+GPT-6 OpenAI tool calls use the Responses endpoint independently of
+\code{web_search}. Older models retain Chat Completions when search is
+off; existing Responses histories keep their wire when continued.}
 
 \item{max_turns}{Integer. Maximum tool-use turns (default: 20).}
 
@@ -44,10 +64,26 @@ snapshot intermediate state so an interrupt mid-turn doesn't lose
 the work that was already done. Errors raised inside the callback
 are swallowed so telemetry/snapshotting can't break a turn.}
 
-\item{cache}{Character. Anthropic prompt caching for the system
-message: \code{"none"} (default), \code{"5m"}, or \code{"1h"}
-ephemeral TTL. Anthropic-only; warns and degrades to \code{"none"}
-for other providers.}
+\item{checkpoint_callback}{Function or NULL. Called after one complete
+assistant tool-use turn and all of its tool results have been appended,
+immediately before the next model request. The signature is
+\code{checkpoint_callback(history, context)}. Return NULL to leave history
+unchanged, or \code{list(history = replacement)} to atomically replace the
+provider-native history used by the next request. \code{context} contains
+\code{agent_turn}, \code{provider}, \code{model}, \code{assistant_text},
+\code{tool_call_count}, and the provider's \code{usage} for that turn.
+Unlike \code{history_callback}, errors propagate because this callback is
+part of agent-loop control rather than best-effort telemetry.}
+
+\item{cache}{Character. Anthropic prompt caching: \code{"none"}
+(default), \code{"5m"}, or \code{"1h"} ephemeral TTL. Places a
+marker on the system message and another on the tail of the
+message history, so each request in the loop reads the previous
+request's context from cache and pays fresh input only for the
+blocks appended since. Billing-only: the model receives identical
+input either way. Anthropic-only; warns and degrades to
+\code{"none"} for other providers. \code{$usage} reports what was
+read and written.}
 
 \item{thinking_budget_tokens}{Integer or NULL. Anthropic extended
 thinking budget; must be at least 1024 and less than
@@ -67,10 +103,68 @@ the Responses endpoint), \code{"anthropic"},
 rather than via \code{tool_handler}); ignored with a warning
 otherwise.}
 
+\item{on_delta}{Function or NULL. Called with each fragment of the
+model's text as it arrives, before the response is complete, so a
+caller can start displaying or speaking it. Called many times per
+turn, with a single non-empty character scalar each time; its
+return value is ignored.
+
+Calling \code{\link{llm_cancel}} from inside it abandons the
+request: the connection closes, the provider stops generating, and
+\code{agent()} returns immediately with \code{cancelled = TRUE} and
+whatever text had arrived. The assistant message is not appended to
+\code{history} in that case, because a partial one can carry an
+unmatched tool call that breaks the following request; the caller
+knows what was delivered and records it.
+
+Wired for every provider.}
+
+\item{thinking}{Character, list, or NULL. The Anthropic
+\code{thinking} request field, for models where a budget is not the
+control: a type name such as \code{"adaptive"}, \code{"disabled"},
+or \code{"between_tools"}, or the field itself as a list, e.g.
+\code{list(type = "adaptive", display = "summarized")}. Sent as
+given on every request of the loop; which types a model accepts is
+the provider's rule (Claude Sonnet 5.5 answers without thinking
+first under \code{"between_tools"} and refuses \code{"disabled"}).
+Cannot be combined with \code{thinking_budget_tokens}.
+Anthropic-only; ignored with a warning for other providers.}
+
+\item{request_callback}{Optional function receiving one observational event
+list per request start and per attempt end/error. Events contain the final
+`serialized_request` at start (authentication headers excluded), logical
+request and attempt IDs, provider/wire, requested and reported model,
+raw usage, stop reason, response ID, allowlisted request-ID headers and
+elapsed milliseconds when available. A transport retry has a new attempt
+ID under the same logical request. Callback errors are isolated from the
+request. Treat request bodies as private: they include exact user content.
+Missing usage/headers remain NULL, including cancelled streams where the
+provider never sent them. See [chat()] for the same observer on chat calls.}
+
 \item{...}{Additional parameters passed to the API.}
 }
 \value{
-List with final response and conversation history. The
+List with final response and conversation history.
+
+  A response the provider cut off before completion returns
+  immediately with \code{truncated = TRUE}: its tool calls are not
+  executed (a call the cutoff interrupted carries partial arguments,
+  or was dropped from the response entirely) and the partial
+  assistant message is not appended to \code{history}, for the same
+  reason as the cancelled path. \code{truncation_reason} carries the
+  wire's own reason: \code{"max_tokens"}, \code{"length"}, or
+  \code{"max_output_tokens"} for the output-token budget (raise
+  \code{max_tokens} via \code{...} to avoid it),
+  \code{"model_context_window_exceeded"} when input plus output
+  overflowed the model's window (shorten the input instead), or
+  another provider reason such as \code{"content_filter"}.
+  \code{$content} ends with a matching marker --
+  \code{"[Output truncated: max_tokens]"},
+  \code{"[Output truncated: model_context_window_exceeded]"}, or
+  \code{"[Response incomplete: <reason>]"} -- so callers that only
+  read the text still see the cutoff.
+
+  The
   returned \code{$usage} carries cumulative \code{input_tokens},
   \code{output_tokens}, \code{total_tokens}, and \code{cost} (USD
   scalar, derived from the bundled price snapshot; \code{0} for

@@ -3,11 +3,13 @@
 \alias{chat_session}
 \title{Create a stateful chat session}
 \usage{
-chat_session(model = NULL, system_prompt = NULL,
-             provider = c("openai", "anthropic", "anthropic_claude",
-                          "moonshot", "openai_codex", "ollama",
-                          "openai_compatible"),
-             ...)
+chat_session(
+  model = NULL,
+  system_prompt = NULL,
+  provider = c("openai", "anthropic", "anthropic_claude", "moonshot", "google",
+    "openai_codex", "ollama", "openai_compatible"),
+  ...
+)
 }
 \arguments{
 \item{model}{Character. Model name.}
@@ -15,8 +17,8 @@ chat_session(model = NULL, system_prompt = NULL,
 \item{system_prompt}{Character or NULL. System prompt.}
 
 \item{provider}{Character. Provider: "openai", "anthropic",
-"anthropic_claude", "moonshot", "openai_codex", "ollama", or
-"openai_compatible".}
+"anthropic_claude", "moonshot", "google", "openai_codex", "ollama",
+or "openai_compatible".}
 
 \item{...}{Additional parameters passed to chat().}
 }
@@ -36,7 +38,7 @@ Returns a list of functions for interacting with the session.
 \examples{
 \dontrun{
 # Create a session
-session <- chat_session(model = "gpt-5.4-mini", system_prompt = "You are helpful.")
+session <- chat_session(model = "gpt-6.1-sol", system_prompt = "You are helpful.")
 
 # Chat (history maintained automatically)
 response <- session$chat("Hello")

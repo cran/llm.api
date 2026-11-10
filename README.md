@@ -18,10 +18,11 @@ Minimal-dependency LLM chat interface. Part of [cornyverse](https://github.com/c
 
 ## Providers
 
-- **openai**: GPT-4o, GPT-4o-mini, o1, o3
-- **anthropic**: Claude (Sonnet, Haiku) via an API key
+- **openai**: GPT-6.1 Sol (default), GPT-6, GPT-5.x, o-series
+- **anthropic**: Claude (Sonnet 4.6 default, Opus, Haiku) via an API key
 - **anthropic_claude**: Claude on a Claude Pro/Max subscription (OAuth, no API key)
 - **moonshot**: Kimi K2 via Moonshot's OpenAI-compatible API
+- **google**: Gemini via Google's OpenAI-compatible endpoint (`GEMINI_API_KEY`)
 - **openai_codex**: Codex Responses via ChatGPT subscription OAuth
 - **ollama**: Llama 3.2, Mistral, Gemma, Phi, Qwen (via server)
 - **openai_compatible**: any OpenAI-compatible endpoint (OpenRouter, DeepSeek, a local proxy, a corporate gateway) via a custom base URL
@@ -30,9 +31,10 @@ Minimal-dependency LLM chat interface. Part of [cornyverse](https://github.com/c
 
 ```r
 # Auto-detect provider from model
-chat("Hello", model = "gpt-5.4-mini")
-chat("Hello", model = "claude-3-5-sonnet-latest")
+chat("Hello", model = "gpt-6.1-sol")
+chat("Hello", model = "claude-opus-5-5")
 chat("Hello", model = "kimi-k2.5")
+chat("Hello", model = "gemini-3.5-flash")
 
 # Use convenience wrappers
 chat_ollama("What is R?")
@@ -41,9 +43,12 @@ chat_claude("Explain machine learning")
 # Explicit Moonshot/Kimi provider
 chat("Write a fast parser in R", provider = "moonshot", model = "kimi-k2.5")
 
+# Google Gemini (see below)
+chat("Write a fast parser in R", provider = "google", model = "gemini-3.5-flash")
+
 # ChatGPT subscription-backed Codex provider (log in once; see below)
 chat_openai_codex("Write a small R function")
-chat("Refactor this loop", provider = "openai_codex", model = "gpt-5.5")
+chat("Refactor this loop", provider = "openai_codex", model = "gpt-6.1-sol")
 
 # Claude subscription-backed provider (log in once; see below)
 chat_claude_oauth("Write a haiku about R")
@@ -84,11 +89,13 @@ openai_codex_login()
 # Thereafter, just use the provider; credentials come from the cache
 # and refresh automatically.
 chat_openai_codex("Write a small R function")
-chat("Refactor this", provider = "openai_codex", model = "gpt-5.5")
+chat("Refactor this", provider = "openai_codex", model = "gpt-6.1-sol")
 ```
 
-Models: `gpt-5.5` (default), `gpt-5.4`, `gpt-5.4-mini`,
-`gpt-5.3-codex-spark`.
+Models, as the Codex cache lists them: `gpt-6.1-sol` (default, the
+workhorse tier), `gpt-6-astra`, `gpt-6.1-terra`, `gpt-6-sol`,
+`gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`;
+`list_models("openai_codex")` reads the current cache.
 
 To use an externally-obtained token instead of logging in, set
 `OPENAI_CODEX_ACCESS_TOKEN` (and optionally `OPENAI_CODEX_ACCOUNT_ID`);
@@ -135,6 +142,29 @@ The API key comes from `OPENAI_COMPATIBLE_API_KEY`, falling back to
 `OPENAI_API_KEY`; a keyless internal gateway (no `Authorization` header)
 works with neither set. A missing base URL or model fails fast with setup
 instructions rather than a curl error.
+
+### Google Gemini
+
+The `google` provider talks to Gemini through Google's OpenAI-compatible
+endpoint (`https://generativelanguage.googleapis.com/v1beta/openai`), so
+`chat()`, streaming, and `agent()` tool loops share the chat-completions
+code path with the other providers. The key comes from `GEMINI_API_KEY`,
+falling back to `GOOGLE_API_KEY`. A model id starting with `gemini`
+auto-detects the provider; the default model is `gemini-3.5-flash`.
+
+```r
+chat("Write a haiku about R", provider = "google")
+agent("Weather in Chicago?", tools = tools, tool_handler = handler,
+      model = "gemini-3.5-flash", provider = "google")
+list_models("google")
+```
+
+Gemini 3 tool calls carry a thought signature that has to be echoed
+back on the next request; `agent()` keeps it on both the streamed and
+non-streamed paths. Google Search grounding is not exposed through this
+endpoint, so `web_search` warns and is ignored for `google`. The free
+tier allows 5 requests per minute per model, which one tool loop can
+use up.
 
 ## Web search
 

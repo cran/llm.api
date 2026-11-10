@@ -20,9 +20,63 @@ expect_equal(llm.api:::.cost_for("gpt-4o", "openai", 1000, 500), 0.0075)
 expect_equal(llm.api:::.cost_for("claude-sonnet-4-6", "anthropic", 1000, 500),
              0.0105)
 
-# Dated Anthropic id resolves to the same per-token rate.
-expect_equal(llm.api:::.cost_for("claude-sonnet-4-20250514", "anthropic", 1000, 500),
+# Dated Anthropic id resolves to its per-token rate
+# (claude-sonnet-4-5-20250929: input 3e-06, output 1.5e-05 -> 0.0105).
+# There is no date stripping: the id has to be a litellm key, and retired
+# dated ids drop out on a refresh (claude-sonnet-4-20250514 left the table
+# in the 2026-11-02 snapshot).
+expect_equal(llm.api:::.cost_for("claude-sonnet-4-5-20250929", "anthropic", 1000, 500),
              0.0105)
+
+# ---- Current-generation models (litellm snapshot 2026-09-02) ----
+# These were NA in the 2026-05-24 snapshot, so every cost a caller
+# summed over a gpt-5.6 or claude-opus-5 run came back NA. The rates
+# below are litellm's; the expected values are computed by hand from
+# them, not read back from .PRICES, so a row that regressed to NA or
+# to a different tier fails here rather than agreeing with itself.
+
+# gpt-5.6-sol on the codex wire: input 4e-06, output 2e-05 -> 0.014.
+# The codex hand table has no 5.6 entry, so this proves the fallthrough
+# to the bare litellm key for provider "openai_codex".
+expect_equal(llm.api:::.cost_for("gpt-5.6-sol", "openai_codex", 1000, 500),
+             0.014)
+expect_equal(llm.api:::.cost_for("gpt-5.6", "openai", 1000, 500), 0.014)
+
+# gpt-5.6-luna: input 2e-07, output 1.2e-06 -> 0.0008.
+expect_equal(llm.api:::.cost_for("gpt-5.6-luna", "openai_codex", 1000, 500),
+             0.0008)
+
+# claude-opus-5: input 5e-06, output 2.5e-05 -> 0.0175, on both
+# Anthropic providers.
+expect_equal(llm.api:::.cost_for("claude-opus-5", "anthropic", 1000, 500),
+             0.0175)
+expect_equal(llm.api:::.cost_for("claude-opus-5", "anthropic_claude", 1000, 500),
+             0.0175)
+
+# ---- The 0.1.9.17 defaults (litellm snapshot 2026-11-02) ----
+# Both were NA in the 2026-09-02 snapshot, so a default call priced as NA.
+
+# claude-opus-5-5: input 4e-06, output 2e-05 -> 0.014, on both Anthropic
+# providers.
+expect_equal(llm.api:::.cost_for("claude-opus-5-5", "anthropic", 1000, 500),
+             0.014)
+expect_equal(llm.api:::.cost_for("claude-opus-5-5", "anthropic_claude", 1000, 500),
+             0.014)
+
+# gpt-6.1-sol: input 2e-06, output 1e-05 -> 0.007. The codex hand table
+# has no 6.1 entry, so the openai_codex row proves the bare-key fallthrough.
+expect_equal(llm.api:::.cost_for("gpt-6.1-sol", "openai", 1000, 500), 0.007)
+expect_equal(llm.api:::.cost_for("gpt-6.1-sol", "openai_codex", 1000, 500),
+             0.007)
+
+# usage_cost() through the OpenAI gross-count path: a codex usage
+# reports input_tokens *including* cached ones, so 4417 in / 4224
+# cached / 5 out is 193 fresh x 4e-06 + 4224 x 4e-07 + 5 x 2e-05.
+expect_equal(llm.api::usage_cost(list(input_tokens = 4417L, output_tokens = 5L,
+                                      cache_read_input_tokens = 4224L),
+                                 model = "gpt-5.6-sol",
+                                 provider = "openai_codex"),
+             193 * 4e-06 + 4224 * 4e-07 + 5 * 2e-05)
 
 # ---- Ollama short-circuits to zero ----
 
@@ -47,6 +101,23 @@ if (!is.null(llm.api:::.PRICES[["moonshot/kimi-k2.5"]])) {
                  expected,
                  info = "moonshot prefix fallback hits moonshot/kimi-k2.5")
 }
+
+# litellm files the Gemini API under "gemini/<id>", so the google
+# provider falls back to that prefix rather than "google/<id>". Pick an
+# id the snapshot holds only in prefixed form so the bare lookup cannot
+# satisfy the assertion.
+local({
+    prices <- llm.api:::.PRICES
+    bare <- sub("^gemini/", "", grep("^gemini/", names(prices), value = TRUE))
+    only_prefixed <- bare[!bare %in% names(prices)]
+    if (length(only_prefixed)) {
+        id <- only_prefixed[[1L]]
+        expect_identical(llm.api:::.price_lookup(id, "google"),
+                         prices[[paste0("gemini/", id)]],
+                         info = "google maps to litellm's gemini/ prefix")
+    }
+    expect_null(llm.api:::.price_lookup("no-such-model", "google"))
+})
 
 # ---- NA / NULL token counts treated as zero ----
 
@@ -235,4 +306,24 @@ local({
     expect_equal(res$usage$cache_creation$ephemeral_1h_input_tokens, 2000)
     expect_equal(llm.api::usage_cost("claude-sonnet-4-6", "anthropic", res$usage),
                  res$usage$cost)
+})
+
+# Gemini reports thinking tokens only in total_tokens; they bill as output.
+local({
+    ids <- grep("^gemini/", names(llm.api:::.PRICES), value = TRUE)
+    if (length(ids)) {
+        id <- sub("^gemini/", "", ids[[1L]])
+        thought <- list(prompt_tokens = 12, completion_tokens = 2,
+                        total_tokens = 120)
+        plain <- list(prompt_tokens = 12, completion_tokens = 108)
+        expect_equal(llm.api::usage_cost(id, "google", thought),
+                     llm.api::usage_cost(id, "google", plain))
+    }
+    u <- list(prompt_tokens = 12, completion_tokens = 2, total_tokens = 120)
+    expect_equal(llm.api:::.usage_output_tokens(u, "google"), 108)
+    # Other providers keep the reported completion count.
+    expect_equal(llm.api:::.usage_output_tokens(u, "openai"), 2)
+    # agent() aggregates carry no prompt_tokens and pass through.
+    agg <- list(input_tokens = 12, output_tokens = 108, total_tokens = 120)
+    expect_equal(llm.api:::.usage_output_tokens(agg, "google"), 108)
 })

@@ -1,3 +1,288 @@
+# llm.api 0.2.0
+
+CRAN release. It collects the development versions 0.1.9.1 through
+0.1.9.18, whose entries below give the detail.
+
+* New `google` provider: Gemini through Google's OpenAI-compatible
+  endpoint, for `chat()`, `agent()`, `chat_session()`, `list_models()`
+  and cost lookup.
+* Streaming on every provider. `agent()` gains `on_delta`, called with
+  each fragment of text as it arrives, and `llm_cancel()` abandons a
+  response from inside it. `chat(stream = TRUE)`, which threw on every
+  call in 0.1.9, works on every provider.
+* Images in a user turn: `llm_image()`, `llm_content()`, and
+  `llm_has_image()`, translated to each provider's block format.
+* `list_models()` lists a provider's model identifiers, and
+  `agent_uses_responses()` reports whether an `agent()` call uses the
+  OpenAI Responses wire.
+* `agent()` gains `checkpoint_callback` (replace history at a safe
+  between-turn boundary), `request_callback` (observe each request and
+  transport attempt), `thinking` (the Anthropic thinking type), and
+  `prompt = NULL` to continue an existing history. `chat()` gains
+  `request_callback` and `thinking`.
+* `agent()` returns `truncated = TRUE` with a `truncation_reason` when the
+  provider cuts a response off, and no longer runs the tool calls of a
+  cut-off response.
+* The Anthropic `agent()` path always streams, and a request the transport
+  loses before any byte arrives is retried once.
+* `cache = "5m"` / `"1h"` caches the Anthropic message history, not only
+  the system prompt.
+* GPT-6 tool calls on `openai` use the Responses endpoint, and
+  `history_tool_calls()` reads those histories.
+* The `openai` and `openai_codex` default model is `gpt-6.1-sol`. The
+  `anthropic` default is `claude-sonnet-4-6`, as in 0.1.9.
+* Price snapshot refreshed to 2026-11-02; `prices_snapshot_digest()`
+  fingerprints the bundled table. Gemini cost counts thinking tokens.
+
+# llm.api 0.1.9.18
+
+* The `anthropic` and `anthropic_claude` default model is
+  `claude-sonnet-4-6` again, as in the 0.1.9 release. 0.1.9.17 had moved it
+  to `claude-opus-5-5`, which changed what callers relying on the default
+  were sent and billed for. Pass `model = "claude-opus-5-5"` to use it; its
+  prices stay in the snapshot. The `openai` and `openai_codex` default
+  remains `gpt-6.1-sol`.
+* Request IDs passed to `request_callback` now start with the time the
+  session made its first request. The prefix was assigned when the package
+  was installed, so every session of one installed copy shared it and only
+  the process ID and counter told sessions apart.
+* `chat(stream = TRUE)` streams on `anthropic` and `anthropic_claude`. It
+  posted once and printed nothing; it now prints the text as it arrives,
+  as on the other providers.
+* `history_tool_calls()` and `history_count_tool_calls()` read Responses
+  histories (`openai_codex`, and `openai` when `agent_uses_responses()` is
+  `TRUE`). They returned no calls for these, which since 0.1.9.17 includes
+  a tool run on the default `openai` model. Such records carry
+  `provider_shape = "responses"`.
+* Gemini cost counts thinking tokens. Google's OpenAI-compatible endpoint
+  reports them only in `total_tokens`, so `usage_cost()` priced a reply
+  with 2 answer tokens and 106 thinking tokens as 2 output tokens.
+  `agent()`'s cumulative `output_tokens` for `google` includes them too.
+
+# llm.api 0.1.9.17
+
+* Default models move up a tier: `anthropic` and `anthropic_claude` default
+  to `claude-opus-5-5`, and `openai` and `openai_codex` default to
+  `gpt-6.1-sol`, the model the Codex catalog lists first as its workhorse.
+  The convenience wrappers (`chat_claude()`, `chat_claude_oauth()`,
+  `chat_openai()`, `chat_openai_codex()`, the `chat_session_*()` family)
+  and `agent()`'s fallback follow. Calls that pass `model` are unaffected.
+  A tool call on `gpt-6.1-sol` through `openai` goes over Responses, as for
+  every GPT-6 model.
+* Price snapshot refreshed to 2026-11-02 so the new defaults, the Claude 5.5
+  family, GPT-6 and `gemini-3.8-flash` have cost data.
+
+# llm.api 0.1.9.16
+
+* Add the `google` provider: Gemini through Google's OpenAI-compatible
+  endpoint, for `chat()`, `agent()`, `chat_session()`, `list_models()` and
+  cost lookup. The key comes from `GEMINI_API_KEY`, then `GOOGLE_API_KEY`;
+  a model id starting with `gemini` auto-detects the provider and the
+  default model is `gemini-3.5-flash`. `web_search` is not available
+  through that endpoint and warns as unsupported.
+* The bundled price-table fingerprint now hashes the serialized payload
+  without the stream header, which records the R version that wrote it.
+  The provenance test only passed on the R version that generated the
+  snapshot and failed once CI moved to R 4.6.2.
+* Streamed tool calls keep provider extras such as Gemini's `extra_content`
+  thought signature, which Gemini 3 requires on the echoed call. A streamed
+  `agent()` tool loop against Gemini previously failed on the second request
+  with a 400.
+
+# llm.api 0.1.9.15
+
+* Add optional `request_callback` to `agent()` and `chat()`. Observe the exact
+  serialized request, each transport attempt, raw usage, requested/reported
+  model, provider response IDs, allowlisted request-ID headers and timing.
+  Final replies and partial streaming failures are covered; callback errors
+  never trigger transport retries. Authentication headers are excluded.
+* Add offline `prices_snapshot_digest()` fingerprints for the bundled price
+  table and calculation source, including provider overrides.
+
+# llm.api 0.1.9.14
+
+* GPT-6 tool calls through `agent(provider = "openai")` now use Responses
+  even when web search is disabled. Continued Responses histories keep
+  that wire if tools are later removed. Older models retain their existing
+  Chat Completions path; `openai_codex` continues using Responses.
+  Switching an existing Chat Completions conversation to Responses preserves
+  earlier function calls and their matching results.
+* Responses requests accept `max_completion_tokens` as an output-cap alias.
+* Export `agent_uses_responses()` so hosts can check the same routing decision
+  as `agent()` before offering tools that require an editable history format.
+* Add `list_models()` for provider catalogs and the local Codex model cache.
+  This lists identifiers without generating a model response.
+
+# llm.api 0.1.9.13
+
+* `agent()` and `chat()` take `thinking`, the Anthropic thinking type:
+  a name such as `"adaptive"` or `"between_tools"`, or the request field
+  as a list, e.g. `list(type = "adaptive", display = "summarized")`.
+  Claude Sonnet 5.5 has no thinking budget; it thinks by default, answers
+  without thinking first under `"between_tools"`, and refuses
+  `"disabled"`. The value is sent as given. It cannot be combined with
+  `thinking_budget_tokens`, and other providers ignore it with a warning.
+  Passing `thinking = ` used to fail as a malformed
+  `thinking_budget_tokens`, because R matched the name by prefix.
+
+# llm.api 0.1.9.12
+
+* Anthropic replies that cite web search results no longer come back with
+  line breaks in the middle of sentences. The API returns such a reply as
+  several text blocks, cut at each citation, and `chat()` and `agent()`
+  joined them with a newline. Consecutive text blocks are now joined
+  directly; text on either side of a search, tool call, or thinking block
+  is separated by a blank line.
+
+# llm.api 0.1.9.11
+
+* Streamed Anthropic `server_tool_use` blocks (web search) no longer keep
+  their `partial_json` scaffolding: the fragments are parsed into `input`
+  and the field removed at block stop, as for `tool_use`. Previously the
+  block went into the agent history verbatim and the API refused every
+  later request in the conversation (`server_tool_use.partial_json: Extra
+  inputs are not permitted`). The query is recoverable from a streamed
+  block as a result, so `searches` no longer come back empty.
+
+# llm.api 0.1.9.10
+
+* The `openai_codex` provider now drops unsupported `temperature` sampling
+  controls with a once-per-session warning, matching its existing handling of
+  unsupported output-token caps. Generic callers no longer receive a 400 from
+  the subscription Codex endpoint for this provider-neutral option.
+
+# llm.api 0.1.9.9
+
+* **Agent hosts can checkpoint or compact at a safe between-turn boundary.**
+  `agent()` gains an optional `checkpoint_callback(history, context)` after an
+  assistant tool-use response and its entire result batch have been appended,
+  but before the next model request. The callback may atomically replace the
+  provider-native history; callback errors propagate so a failed durable
+  checkpoint cannot silently discard state. Existing two-argument tool
+  handlers and callers without the hook are unchanged.
+* `agent(prompt = NULL, history = ...)` continues an existing non-empty
+  provider-native history without inventing a user message. This supports a
+  host's one compact-and-retry response to a real context-window overflow.
+
+# llm.api 0.1.9.8
+
+* **The Anthropic agent path always streams.** `agent()` on
+  `anthropic` / `anthropic_claude` used a plain POST unless the caller
+  passed `on_delta`. A plain POST sends nothing until the whole response
+  is generated, and R's curl aborts a connection that is silent for ten
+  minutes ("Operation too slow. Less than 1 bytes/sec transferred the
+  last 600 seconds"), which one long generation on a large `max_tokens`
+  can be and which a queued request looks identical to. One such abort
+  ended an ARC-AGI-3 game on `claude-opus-5` at 8 of 9 levels. Requests
+  now go through the SSE transport whether or not there is a callback;
+  it assembles the same response object, so nothing changes for callers.
+* **One retry for a request lost by the transport before any byte
+  arrived.** Curl errors (timeouts, resets, DNS, refused connections) on
+  a request that received nothing are retried once after
+  `getOption("llm.api.transport_wait", 5)` seconds, on both the plain
+  POST and the SSE transport. A request that had started to answer is
+  not retried, since re-sending it would bill the generation twice; API
+  errors propagate untouched.
+
+# llm.api 0.1.9.7
+
+* **Price snapshot refreshed to litellm as of 2026-09-02** (2,778 models,
+  from 2,157 on 2026-05-24, which had passed the package's own 90-day
+  staleness threshold). Adds the current generation: `gpt-5.6` and its
+  `-sol` / `-luna` / `-terra` / `-cyber` variants, and `claude-opus-5`,
+  all of which priced as `NA` before, so any `usage$cost` summed over
+  a run on them came back `NA`. `gpt-5.6-sol` on the codex wire resolves
+  through the bare litellm key (input $4/M, cached $0.40/M), so the
+  hand-maintained codex table needed no entry. `prices_snapshot_stale()`
+  is `FALSE` again.
+
+# llm.api 0.1.9.6
+
+* **`cache` now covers the message history, not just the system
+  prompt.** `cache = "5m"` / `"1h"` also places a `cache_control`
+  marker on the final cacheable block of the final message, so request
+  N+1 in an `agent()` loop reads request N's context from cache and
+  pays fresh input only for the blocks appended since. With the marker
+  on system alone, only the static prefix was ever read back: on one
+  agentic run whose history reached ~429k tokens across 239 requests,
+  the system marker covered about 0.5% of 59.4M input tokens. Exactly
+  one history marker goes out per request however many preceded it
+  (the helper strips any already present), the marker is applied to
+  the request copy and never to the caller's history, and `"none"` is
+  byte-identical to before. `chat()`'s body assembly is split out as
+  `.anthropic_chat_body()` so that path is testable without a network
+  stub. Not handled: a single request appending more than 20 positions
+  of non-tool content, which falls outside Anthropic's lookback and
+  rewrites the prefix; documented on the helper.
+
+# llm.api 0.1.9.5
+
+* **`agent()` no longer treats a cut-off response as a clean
+  completion** (#38). A truncated response returned through the
+  no-tool-calls branch: an interrupted tool call either executed with
+  partial arguments or was dropped, so a mid-task cutoff presented as
+  a normal finish, possibly with empty content. Every wire's cutoff
+  signal is now parsed — Anthropic `stop_reason` `"max_tokens"` and
+  `"model_context_window_exceeded"`, chat-completions
+  `finish_reason = "length"`, Responses `status = "incomplete"`
+  (`max_output_tokens` and `content_filter` alike) — on both the
+  streamed and non-streamed transports. On any of them the loop warns
+  and returns immediately with `truncated = TRUE` and
+  `truncation_reason` (the wire's literal reason), tool calls
+  unexecuted, the partial assistant message left out of `history` (as
+  on the cancelled path), and `$content` ending in a matching marker:
+  `[Output truncated: max_tokens]`,
+  `[Output truncated: model_context_window_exceeded]`, or
+  `[Response incomplete: <reason>]`.
+
+* `chat()` on the Responses paths (`openai_codex`, and `openai` routed
+  through Responses) reported `finish_reason = NULL` even for
+  incomplete responses; it now maps to the documented vocabulary:
+  `"stop"`, `"length"` for `max_output_tokens`, or the literal reason
+  (e.g. `"content_filter"`).
+
+# llm.api 0.1.9.4
+
+* **Every provider streams.** `on_delta` and `llm_cancel()` now work on
+  the Chat Completions wire (`openai`, `moonshot`, `ollama`,
+  `openai_compatible`) and on the Anthropic Messages wire, not only on
+  the Responses providers. Passing `on_delta` no longer warns anywhere,
+  because there is nowhere left that ignores it.
+
+* Anthropic content arrives as indexed blocks, and a tool call's
+  arguments as `partial_json` fragments that are spliced and parsed only
+  once the block closes. Both wires reassemble into exactly the
+  non-streamed response shape, so the two paths compare with
+  `identical()`.
+
+* **`chat(stream = TRUE)` was broken and is fixed.** It set curl's
+  `writefunction` handle option, which curl 7.x rejects outright, so
+  every streamed `chat()` threw before reaching the network. Nothing
+  caught it: streaming is only used interactively and no test exercised
+  it. It also reports `usage` now, where it always returned NULL.
+
+# llm.api 0.1.9.2
+
+* **The model's text, while it is still being written.** `agent()` gains
+  `on_delta`, called with each fragment as it arrives on the Responses
+  wire (`openai_codex`, and `openai` when `web_search` routes it there).
+  Calling `llm_cancel()` from inside it abandons the request: the
+  connection closes, the provider stops generating, and `agent()`
+  returns `cancelled = TRUE` with the text that had arrived. Every other
+  provider posts once and waits, so passing `on_delta` there warns
+  rather than doing nothing quietly. Nothing changes for a caller that
+  does not pass one.
+
+# llm.api 0.1.9.1
+
+* Images in a user turn. `llm_image()` wraps a file (or raw bytes) and
+  `llm_content()` mixes it with text; pass the result as `prompt` to
+  `chat()` or `agent()`. Provider-neutral: the same call works against
+  Anthropic, the Chat Completions API, and the OpenAI Responses API,
+  which spell the block three different ways. `llm_has_image()` is
+  there for callers that need to gate on whether the model they are
+  pointed at can take one. A plain character prompt is unaffected.
+
 # llm.api 0.1.9
 
 * New `openai_compatible` provider: point `chat()`, `agent()`, and

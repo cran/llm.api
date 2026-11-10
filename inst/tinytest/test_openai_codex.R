@@ -44,8 +44,8 @@ Sys.unsetenv(c("OPENAI_CODEX_ACCESS_TOKEN", "OPENAI_CODEX_REFRESH_TOKEN",
 cfg <- llm.api:::.get_provider_config("openai_codex")
 expect_equal(cfg$base_url, "https://chatgpt.com/backend-api")
 expect_equal(cfg$chat_path, "/codex/responses")
-expect_equal(cfg$default_model, "gpt-5.5")
-expect_equal(provider_default_model("openai_codex"), "gpt-5.5")
+expect_equal(cfg$default_model, "gpt-6.1-sol")
+expect_equal(provider_default_model("openai_codex"), "gpt-6.1-sol")
 
 llm_base("https://chatgpt.com/backend-api")
 expect_equal(llm.api:::.detect_provider(NULL), "openai_codex")
@@ -95,7 +95,7 @@ expect_equal(merged$output[[1L]]$arguments, "{\"a\":1}")
 # Agent loop: first Codex response asks for a tool, second returns text.
 call_count <- 0L
 captured_bodies <- list()
-stub_sse <- function(url, body, headers) {
+stub_sse <- function(url, body, headers, on_delta = NULL) {
     call_count <<- call_count + 1L
     captured_bodies[[call_count]] <<- body
     if (call_count == 1L) {
@@ -186,15 +186,28 @@ b_keep <- llm.api:::.openai_codex_body(mk_user(), list(), "sys", "gpt-5.5",
                                        max_output_tokens = 456L)
 expect_null(b_keep$max_output_tokens)
 
-# Other extra params are still forwarded (drop is scoped to the token caps).
+# Sampling temperature is also unsupported: warn once, then drop it.
+codex_state$warned_temperature <- NULL
+expect_warning(
+    b_temperature <- llm.api:::.openai_codex_body(
+        mk_user(), list(), "sys", "gpt-5.5", temperature = 0.5),
+    "not supported by the Codex backend")
+expect_null(b_temperature$temperature)
+expect_silent(llm.api:::.openai_codex_body(
+    mk_user(), list(), "sys", "gpt-5.5", temperature = 0.2))
+
+# Other extra params are still forwarded.
 b_other <- llm.api:::.openai_codex_body(mk_user(), list(), "sys", "gpt-5.5",
-                                        max_tokens = 5L, temperature = 0.5)
+                                        max_tokens = 5L, metadata = list(test = TRUE))
 expect_null(b_other$max_tokens)
-expect_equal(b_other$temperature, 0.5)
+expect_true(isTRUE(b_other$metadata$test))
 
 # Captured request body through chat(): no token cap reaches /codex/responses.
+# The doubles mirror the real signature rather than taking `...`: they
+# stand in for .openai_codex_post_sse(), and one that quietly accepts
+# any argument stops being a check that the call site is right.
 capture_sse <- function(target) {
-    function(url, body, headers) {
+    function(url, body, headers, on_delta = NULL) {
         target$body <- body
         list(output = list(list(type = "message", content = list(
             list(type = "output_text", text = "ok")))),

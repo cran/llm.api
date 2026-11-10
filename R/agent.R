@@ -5,7 +5,9 @@
 #' Send a prompt to an LLM with tools. Automatically handles tool calls
 #' in a loop until the model responds with text only.
 #'
-#' @param prompt Character. The user message.
+#' @param prompt Character or NULL. The user message. NULL continues directly
+#'   from \code{history} without appending another user message; \code{history}
+#'   must then be non-empty.
 #' @param tools List. Tool definitions (from mcp_tools_for_claude or manual).
 #' @param tool_handler Function. Called with `(name, args)` and returns a
 #'   result string. If it declares a formal named `context`, it also
@@ -15,10 +17,13 @@
 #' @param system Character. System prompt.
 #' @param model Character. Model name.
 #' @param provider Character. Provider: "anthropic", "anthropic_claude", "openai", "moonshot",
-#'   "openai_codex", "ollama", or "openai_compatible" (a generic
+#'   "google", "openai_codex", "ollama", or "openai_compatible" (a generic
 #'   OpenAI-compatible gateway; requires a base URL via
 #'   \code{llm_base()} or \code{OPENAI_COMPATIBLE_BASE_URL}, and an
 #'   explicit \code{model}).
+#'   GPT-6 OpenAI tool calls use the Responses endpoint independently of
+#'   \code{web_search}. Older models retain Chat Completions when search is
+#'   off; existing Responses histories keep their wire when continued.
 #' @param max_turns Integer. Maximum tool-use turns (default: 20).
 #' @param verbose Logical. Print tool calls and results.
 #' @param history List or NULL. Previous conversation history to continue from.
@@ -28,10 +33,25 @@
 #'   snapshot intermediate state so an interrupt mid-turn doesn't lose
 #'   the work that was already done. Errors raised inside the callback
 #'   are swallowed so telemetry/snapshotting can't break a turn.
-#' @param cache Character. Anthropic prompt caching for the system
-#'   message: \code{"none"} (default), \code{"5m"}, or \code{"1h"}
-#'   ephemeral TTL. Anthropic-only; warns and degrades to \code{"none"}
-#'   for other providers.
+#' @param checkpoint_callback Function or NULL. Called after one complete
+#'   assistant tool-use turn and all of its tool results have been appended,
+#'   immediately before the next model request. The signature is
+#'   \code{checkpoint_callback(history, context)}. Return NULL to leave history
+#'   unchanged, or \code{list(history = replacement)} to atomically replace the
+#'   provider-native history used by the next request. \code{context} contains
+#'   \code{agent_turn}, \code{provider}, \code{model}, \code{assistant_text},
+#'   \code{tool_call_count}, and the provider's \code{usage} for that turn.
+#'   Unlike \code{history_callback}, errors propagate because this callback is
+#'   part of agent-loop control rather than best-effort telemetry.
+#' @param cache Character. Anthropic prompt caching: \code{"none"}
+#'   (default), \code{"5m"}, or \code{"1h"} ephemeral TTL. Places a
+#'   marker on the system message and another on the tail of the
+#'   message history, so each request in the loop reads the previous
+#'   request's context from cache and pays fresh input only for the
+#'   blocks appended since. Billing-only: the model receives identical
+#'   input either way. Anthropic-only; warns and degrades to
+#'   \code{"none"} for other providers. \code{$usage} reports what was
+#'   read and written.
 #' @param thinking_budget_tokens Integer or NULL. Anthropic extended
 #'   thinking budget; must be at least 1024 and less than
 #'   \code{max_tokens}. Anthropic-only; ignored with a warning for
@@ -48,9 +68,54 @@
 #'   (the \code{$web_search} builtin, whose calls are handled internally
 #'   rather than via \code{tool_handler}); ignored with a warning
 #'   otherwise.
+#' @param on_delta Function or NULL. Called with each fragment of the
+#'   model's text as it arrives, before the response is complete, so a
+#'   caller can start displaying or speaking it. Called many times per
+#'   turn, with a single non-empty character scalar each time; its
+#'   return value is ignored.
+#'
+#'   Calling \code{\link{llm_cancel}} from inside it abandons the
+#'   request: the connection closes, the provider stops generating, and
+#'   \code{agent()} returns immediately with \code{cancelled = TRUE} and
+#'   whatever text had arrived. The assistant message is not appended to
+#'   \code{history} in that case, because a partial one can carry an
+#'   unmatched tool call that breaks the following request; the caller
+#'   knows what was delivered and records it.
+#'
+#'   Wired for every provider.
+#' @param thinking Character, list, or NULL. The Anthropic
+#'   \code{thinking} request field, for models where a budget is not the
+#'   control: a type name such as \code{"adaptive"}, \code{"disabled"},
+#'   or \code{"between_tools"}, or the field itself as a list, e.g.
+#'   \code{list(type = "adaptive", display = "summarized")}. Sent as
+#'   given on every request of the loop; which types a model accepts is
+#'   the provider's rule (Claude Sonnet 5.5 answers without thinking
+#'   first under \code{"between_tools"} and refuses \code{"disabled"}).
+#'   Cannot be combined with \code{thinking_budget_tokens}.
+#'   Anthropic-only; ignored with a warning for other providers.
 #' @param ... Additional parameters passed to the API.
 #'
-#' @return List with final response and conversation history. The
+#' @return List with final response and conversation history.
+#'
+#'   A response the provider cut off before completion returns
+#'   immediately with \code{truncated = TRUE}: its tool calls are not
+#'   executed (a call the cutoff interrupted carries partial arguments,
+#'   or was dropped from the response entirely) and the partial
+#'   assistant message is not appended to \code{history}, for the same
+#'   reason as the cancelled path. \code{truncation_reason} carries the
+#'   wire's own reason: \code{"max_tokens"}, \code{"length"}, or
+#'   \code{"max_output_tokens"} for the output-token budget (raise
+#'   \code{max_tokens} via \code{...} to avoid it),
+#'   \code{"model_context_window_exceeded"} when input plus output
+#'   overflowed the model's window (shorten the input instead), or
+#'   another provider reason such as \code{"content_filter"}.
+#'   \code{$content} ends with a matching marker --
+#'   \code{"[Output truncated: max_tokens]"},
+#'   \code{"[Output truncated: model_context_window_exceeded]"}, or
+#'   \code{"[Response incomplete: <reason>]"} -- so callers that only
+#'   read the text still see the cutoff.
+#'
+#'   The
 #'   returned \code{$usage} carries cumulative \code{input_tokens},
 #'   \code{output_tokens}, \code{total_tokens}, and \code{cost} (USD
 #'   scalar, derived from the bundled price snapshot; \code{0} for
@@ -62,6 +127,16 @@
 #'   / \code{cache_creation$ephemeral_1h_input_tokens}. Passing this
 #'   \code{$usage} back to \code{\link{usage_cost}} recomputes the same
 #'   \code{cost}.
+#' @param request_callback Optional function receiving one observational event
+#'   list per request start and per attempt end/error. Events contain the final
+#'   `serialized_request` at start (authentication headers excluded), logical
+#'   request and attempt IDs, provider/wire, requested and reported model,
+#'   raw usage, stop reason, response ID, allowlisted request-ID headers and
+#'   elapsed milliseconds when available. A transport retry has a new attempt
+#'   ID under the same logical request. Callback errors are isolated from the
+#'   request. Treat request bodies as private: they include exact user content.
+#'   Missing usage/headers remain NULL, including cancelled streams where the
+#'   provider never sent them. See [chat()] for the same observer on chat calls.
 #' @export
 #'
 #' @examples
@@ -81,12 +156,19 @@
 agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
                   model = NULL,
                   provider = c("anthropic", "anthropic_claude", "openai", "moonshot",
-                               "openai_codex", "ollama", "openai_compatible"),
+                               "google", "openai_codex", "ollama", "openai_compatible"),
                   max_turns = 20L, verbose = TRUE, history = NULL,
-                  history_callback = NULL, cache = c("none", "5m", "1h"),
-                  thinking_budget_tokens = NULL, web_search = FALSE, ...) {
+                  history_callback = NULL, checkpoint_callback = NULL,
+                  cache = c("none", "5m", "1h"),
+                  thinking_budget_tokens = NULL, web_search = FALSE,
+                  on_delta = NULL, thinking = NULL, request_callback = NULL,
+                  ...) {
     provider <- match.arg(provider)
+    previous_request <- .request_enter(request_callback, provider)
+    on.exit(.request_runtime$current <- previous_request, add = TRUE)
     cache <- match.arg(cache)
+    thinking <- .validate_thinking(thinking)
+    .check_thinking_exclusive(thinking, thinking_budget_tokens)
 
     # Anthropic-only feature opt-ins emit a one-time warning when a
     # non-default value is passed against another provider so the
@@ -107,6 +189,20 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
             thinking_budget_tokens <- NULL
         }
     }
+    if (!is.null(thinking) && !.is_anthropic(provider)) {
+        warning("`thinking` is Anthropic-only; ignoring for provider \"",
+                provider, "\".", call. = FALSE)
+        thinking <- NULL
+    }
+    # Every provider streams now, so there is nothing left to warn
+    # about -- only the shape of the callback itself to check.
+    if (!is.null(on_delta) && !is.function(on_delta)) {
+        stop("`on_delta` must be a function of one argument.", call. = FALSE)
+    }
+    if (!is.null(checkpoint_callback) && !is.function(checkpoint_callback)) {
+        stop("`checkpoint_callback` must be a function of two arguments.",
+             call. = FALSE)
+    }
     if (!isFALSE(web_search) && !provider %in% .web_search_providers()) {
         warning("`web_search` is not yet supported for provider \"", provider,
                 "\"; ignoring.", call. = FALSE)
@@ -120,21 +216,17 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
     config <- .get_provider_config(provider)
     .check_openai_compatible(config, model)
 
-    # Default models with tool support
+    # The provider table is the one place a default model is named.
     if (is.null(model)) {
-        model <- switch(provider, anthropic =,
-                        anthropic_claude = "claude-sonnet-4-6",
-                        openai = "gpt-5.4-mini", moonshot = "kimi-k2.5",
-                        openai_codex = "gpt-5.5", ollama = "qwen3.5:9b")
+        model <- config$default_model
     }
 
-    # Server-side web search on the standard openai provider runs over the
-    # Responses endpoint (the chat-completions path can't search the default
-    # models). The whole run then uses the Responses wire shape -- flat tools,
-    # function_call_output results -- which matches the openai_codex format, so
-    # `wire` drives tool conversion / dispatch / result append while `provider`
-    # stays "openai" for cost lookup and the returned object.
-    use_responses <- identical(provider, "openai") && !isFALSE(web_search)
+    # GPT-6 tool calls require Responses even with search disabled. Older
+    # models retain their supported Chat Completions wire (including hosts
+    # that edit that history shape).
+    # Keep the same wire when continuing a Responses history without tools.
+    use_responses <- identical(provider, "openai") &&
+    agent_uses_responses(provider, model, tools, web_search, history)
     if (use_responses) {
         wire <- "openai_codex"
     } else if (identical(provider, "anthropic_claude")) {
@@ -145,11 +237,11 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
         # don't match the literal "anthropic_claude" and the messages array
         # gets corrupted on the turn after a tool call (a 400 from the API).
         wire <- "anthropic"
-    } else if (identical(provider, "openai_compatible")) {
-        # Generic gateways speak the OpenAI chat-completions wire shape,
-        # so the openai wire drives tool conversion / dispatch / result
-        # appending while `provider` stays "openai_compatible" for cost
-        # lookup and the returned object.
+    } else if (provider %in% c("openai_compatible", "google")) {
+        # Generic gateways and Gemini's compat endpoint speak the OpenAI
+        # chat-completions wire shape, so the openai wire drives tool
+        # conversion / dispatch / result appending while `provider` stays
+        # as given for cost lookup and the returned object.
         wire <- "openai"
     } else {
         wire <- provider
@@ -173,7 +265,13 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
     } else {
         messages <- list()
     }
-    messages[[length(messages) + 1]] <- list(role = "user", content = prompt)
+    if (is.null(prompt)) {
+        if (length(messages) == 0L) {
+            stop("`prompt = NULL` requires non-empty `history`.", call. = FALSE)
+        }
+    } else {
+        messages[[length(messages) + 1L]] <- list(role = "user", content = prompt)
+    }
 
     turn <- 0L
 
@@ -204,23 +302,28 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
         # Make API request with tools
         response <- if (use_responses) {
             .agent_openai_responses(messages, provider_tools, system, model,
-                                    config, web_search = web_search, ...)
+                                    config, web_search = web_search,
+                                    on_delta = on_delta, ...)
         } else switch(provider,
                       anthropic =,
                       anthropic_claude = .agent_anthropic(messages, provider_tools, system, model, config,
                 cache = cache,
                 thinking_budget_tokens = thinking_budget_tokens,
-                web_search = web_search, ...),
+                web_search = web_search, on_delta = on_delta,
+                thinking = thinking, ...),
                       openai = .agent_openai(messages, provider_tools, system, model,
-                config, ...),
+                config, on_delta = on_delta, ...),
                       moonshot = .agent_openai(messages, provider_tools, system,
-                model, config, ...),
+                model, config, on_delta = on_delta, ...),
+                      google = .agent_openai(messages, provider_tools, system,
+                model, config, on_delta = on_delta, ...),
                       openai_compatible = .agent_openai(messages, provider_tools,
-                system, model, config, ...),
+                system, model, config, on_delta = on_delta, ...),
                       openai_codex = .agent_openai_codex(messages, provider_tools,
-                system, model, config, web_search = web_search, ...),
+                system, model, config, web_search = web_search,
+                on_delta = on_delta, ...),
                       ollama = .agent_ollama(messages, provider_tools, system, model,
-                config, ...)
+                config, on_delta = on_delta, ...)
         )
 
         # Accumulate token usage and per-turn cost. Uses `[[` exact
@@ -236,7 +339,8 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
             # OpenAI/Ollama format
             if (!is.null(u[["prompt_tokens"]])) {
                 total_input_tokens <- total_input_tokens + u[["prompt_tokens"]]
-                total_output_tokens <- total_output_tokens + u[["completion_tokens"]]
+                total_output_tokens <- total_output_tokens +
+                .usage_output_tokens(u, provider)
             }
             # Cache token classes via the shared extractor so the
             # per-TTL Anthropic write split is captured (not just the
@@ -256,6 +360,105 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
         }
         total_citations <- c(total_citations, response$citations %||% list())
         total_searches <- c(total_searches, response$searches %||% list())
+
+        # Cancelled from inside on_delta. Returns before the tool-call
+        # check, because a cancelled response can carry a half-built
+        # tool call and running it would execute something the model
+        # had not finished asking for.
+        #
+        # The assistant message is deliberately NOT appended. A partial
+        # one is the thing most likely to be malformed -- an unmatched
+        # tool_use block makes the *next* request fail, which is a long
+        # way from here -- and the caller knows better than this loop
+        # what was actually delivered. It gets the text and decides.
+        if (isTRUE(response$cancelled)) {
+            return(list(
+                        content = response$text,
+                        cancelled = TRUE,
+                        model = model,
+                        provider = provider,
+                        turns = turn,
+                        history = messages,
+                        usage = list(
+                                     input_tokens = total_input_tokens,
+                                     output_tokens = total_output_tokens,
+                                     total_tokens = total_input_tokens +
+                                     total_output_tokens,
+                                     cache_read_input_tokens = total_cache_read,
+                                     cache_creation_input_tokens =
+                                     total_cache_write_5m + total_cache_write_1h,
+                                     cache_creation = list(
+                            ephemeral_5m_input_tokens = total_cache_write_5m,
+                            ephemeral_1h_input_tokens = total_cache_write_1h),
+                                     cost = if (cost_na) NA_real_ else total_cost
+                    ),
+                        citations = total_citations,
+                        searches = total_searches
+                ))
+        }
+
+        # Cut off at the output-token budget. Checked before the
+        # no-tool-calls branch, because a truncated response is
+        # indistinguishable from a completed one there: a tool call the
+        # cap interrupted either arrives with partial arguments or is
+        # dropped from the response entirely, and running what remains
+        # would execute something the model never finished asking for
+        # (#38). Mirrors the cancelled path: the partial assistant
+        # message is NOT appended (an unmatched tool_use block would 400
+        # the next request built on this history), and the return is
+        # marked so the caller can tell "cut off" from "done".
+        if (isTRUE(response$truncated)) {
+            reason <- response$truncation_reason %||% "max_tokens"
+            if (reason %in% c("max_tokens", "length", "max_output_tokens")) {
+                # One name for the same budget cutoff on every wire.
+                warning("Response truncated at the output-token limit ",
+                        "after ", turn, " turn(s); raise `max_tokens`.",
+                        call. = FALSE)
+                marker <- "[Output truncated: max_tokens]"
+            } else if (identical(reason, "model_context_window_exceeded")) {
+                # Raising max_tokens cannot help here: input plus output
+                # overflowed the model's window.
+                warning("Response truncated at the model context window ",
+                        "after ", turn, " turn(s); shorten the input or ",
+                        "history.", call. = FALSE)
+                marker <- "[Output truncated: model_context_window_exceeded]"
+            } else {
+                # Not a token cutoff (e.g. the Responses wire's
+                # content_filter): same fail-closed handling, accurately
+                # named.
+                warning("Response incomplete (", reason, ") after ",
+                        turn, " turn(s).", call. = FALSE)
+                marker <- paste0("[Response incomplete: ", reason, "]")
+            }
+            return(list(
+                        content = if (nzchar(response$text %||% "")) {
+                        paste0(response$text, "\n\n", marker)
+                    } else {
+                        marker
+                    },
+                        truncated = TRUE,
+                        truncation_reason = reason,
+                        model = model,
+                        provider = provider,
+                        turns = turn,
+                        history = messages,
+                        usage = list(
+                                     input_tokens = total_input_tokens,
+                                     output_tokens = total_output_tokens,
+                                     total_tokens = total_input_tokens +
+                                     total_output_tokens,
+                                     cache_read_input_tokens = total_cache_read,
+                                     cache_creation_input_tokens =
+                                     total_cache_write_5m + total_cache_write_1h,
+                                     cache_creation = list(
+                            ephemeral_5m_input_tokens = total_cache_write_5m,
+                            ephemeral_1h_input_tokens = total_cache_write_1h),
+                                     cost = if (cost_na) NA_real_ else total_cost
+                    ),
+                        citations = total_citations,
+                        searches = total_searches
+                ))
+        }
 
         # Check if done (no tool calls)
         if (length(response$tool_calls) == 0) {
@@ -360,6 +563,34 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
             )
             .fire_history_callback(history_callback, messages)
         }
+
+        # Quiescent boundary between model turns: the assistant message and
+        # every result in its tool batch are complete, and the next provider
+        # request has not started. A host may replace the provider-native
+        # history here (for example, with a compaction summary plus retained
+        # tail) without splitting a tool call/result pair.
+        if (!is.null(checkpoint_callback)) {
+            checkpoint <- checkpoint_callback(
+                messages,
+                list(
+                     agent_turn = turn,
+                     provider = provider,
+                     model = model,
+                     assistant_text = response$text %||% "",
+                     tool_call_count = dispatch_count,
+                     usage = response$usage
+                )
+            )
+            if (!is.null(checkpoint)) {
+                if (!is.list(checkpoint) || is.null(checkpoint$history) ||
+                    !is.list(checkpoint$history)) {
+                    stop("`checkpoint_callback` must return NULL or ",
+                         "`list(history = <list>)`.", call. = FALSE)
+                }
+                messages <- checkpoint$history
+                .fire_history_callback(history_callback, messages)
+            }
+        }
     }
 
     warning("Reached max_turns (", max_turns, ")")
@@ -430,10 +661,16 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
 # Anthropic request
 .agent_anthropic <- function(messages, tools, system, model, config,
                              cache = "none", thinking_budget_tokens = NULL,
-                             ...) {
+                             on_delta = NULL, thinking = NULL, ...) {
     url <- paste0(config$base_url, config$chat_path)
 
-    body <- list(model = model, messages = messages, max_tokens = 4096)
+    # Marker on the translated copy, not on `messages`: the loop keeps
+    # extending that list, and a marker left on it would be re-sent on
+    # every later request alongside the new one.
+    body <- list(model = model,
+                 messages = .anthropic_mark_history(.llm_blocks(messages, "anthropic"),
+            cache),
+                 max_tokens = 4096)
 
     sys <- .anthropic_system(system, cache,
                              oauth = is.function(config$credentials))
@@ -446,6 +683,9 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
     if (!is.null(thinking_budget_tokens)) {
         body$thinking <- list(type = "enabled",
                               budget_tokens = as.integer(thinking_budget_tokens))
+    }
+    if (!is.null(thinking)) {
+        body$thinking <- thinking
     }
 
     extra <- list(...)
@@ -460,16 +700,20 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
 
     headers <- .anthropic_headers(config)
 
-    resp <- .post_json(url, body, headers)
+    # Always stream. A plain POST sends nothing until the whole response
+    # is generated, and R's curl aborts a connection that is silent for
+    # ten minutes -- which one long generation on a large max_tokens can
+    # be, and which a queued request looks identical to. On a stream the
+    # bytes flow as tokens are produced (Anthropic pings through pauses),
+    # so the cutoff only trips on a genuine stall. With no on_delta the
+    # SSE path assembles the same response object the plain POST did.
+    resp <- .anthropic_post_sse(url, body, headers, on_delta = on_delta)
 
     # Parse response
-    text_parts <- character()
     tool_calls <- list()
 
     for (block in resp$content) {
-        if (block$type == "text") {
-            text_parts <- c(text_parts, block$text)
-        } else if (block$type == "tool_use") {
+        if (block$type == "tool_use") {
             tool_calls[[length(tool_calls) + 1]] <- list(
                 id = block$id,
                 name = block$name,
@@ -480,9 +724,25 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
 
     search_info <- .anthropic_search_blocks(resp$content)
 
+    # Both the non-streamed response and the SSE reassembly carry
+    # stop_reason. "max_tokens" is the output budget cutting the
+    # response off; "model_context_window_exceeded" is input plus
+    # output overflowing the window. Anthropic documents both as
+    # truncation, and either can leave a partial tool_use block.
+    truncated <- isTRUE(resp$stop_reason %in%
+                        c("max_tokens", "model_context_window_exceeded"))
+
+    types <- vapply(resp$content, function(b) b$type %||% "", character(1))
+    texts <- vapply(resp$content, function(b) {
+        as.character(b$text %||% NA_character_)[1L]
+    }, character(1))
+
     list(
-         text = paste(text_parts, collapse = "\n"),
+         text = .anthropic_join_text(types, texts),
          tool_calls = tool_calls,
+         cancelled = isTRUE(attr(resp, "llm_cancelled")),
+         truncated = truncated,
+         truncation_reason = if (truncated) resp$stop_reason,
          assistant_message = list(role = "assistant", content = resp$content),
          usage = resp$usage, # input_tokens, output_tokens
          citations = search_info$citations,
@@ -491,7 +751,8 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
 }
 
 # OpenAI request
-.agent_openai <- function(messages, tools, system, model, config, ...) {
+.agent_openai <- function(messages, tools, system, model, config,
+                          on_delta = NULL, ...) {
     url <- paste0(config$base_url, config$chat_path)
 
     # Build messages with system
@@ -499,7 +760,7 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
     if (!is.null(system)) {
         api_messages[[1]] <- list(role = "system", content = system)
     }
-    api_messages <- c(api_messages, messages)
+    api_messages <- c(api_messages, .llm_blocks(messages, "openai"))
 
     body <- list(model = model, messages = api_messages)
 
@@ -530,7 +791,13 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
         headers["Authorization"] <- paste("Bearer", config$api_key)
     }
 
-    resp <- .post_json(url, body, headers)
+    # Streamed only when someone is watching. The two paths return the
+    # same shape, so everything below this line is unaware of which ran.
+    resp <- if (is.null(on_delta)) {
+        .post_json(url, body, headers)
+    } else {
+        .openai_cc_post_sse(url, body, headers, on_delta = on_delta)
+    }
 
     # Parse response
     choice <- resp$choices[[1]]
@@ -555,22 +822,30 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
     list(
          text = msg$content %||% "",
          tool_calls = tool_calls,
+         cancelled = isTRUE(attr(resp, "llm_cancelled")),
+         # "length" is the chat-completions wire's max_tokens cutoff.
+         truncated = identical(choice$finish_reason, "length"),
+         truncation_reason = if (identical(choice$finish_reason, "length")) {
+            "length"
+        },
          assistant_message = msg,
          usage = resp$usage # prompt_tokens, completion_tokens, total_tokens
     )
 }
 
 # Ollama request (OpenAI-compatible)
-.agent_ollama <- function(messages, tools, system, model, config, ...) {
+.agent_ollama <- function(messages, tools, system, model, config,
+                          on_delta = NULL, ...) {
     url <- paste0(config$base_url, config$chat_path)
 
     api_messages <- list()
     if (!is.null(system)) {
         api_messages[[1]] <- list(role = "system", content = system)
     }
-    api_messages <- c(api_messages, messages)
+    api_messages <- c(api_messages, .llm_blocks(messages, "openai"))
 
-    body <- list(model = model, messages = api_messages, stream = FALSE)
+    body <- list(model = model, messages = api_messages,
+                 stream = !is.null(on_delta))
 
     if (length(tools) > 0) {
         body$tools <- tools
@@ -583,7 +858,11 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
 
     headers <- c("Content-Type" = "application/json")
 
-    resp <- .post_json(url, body, headers)
+    resp <- if (is.null(on_delta)) {
+        .post_json(url, body, headers)
+    } else {
+        .openai_cc_post_sse(url, body, headers, on_delta = on_delta)
+    }
 
     # Parse response (OpenAI-compatible format: choices[].message)
     msg <- resp$choices[[1]]$message
@@ -616,6 +895,13 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
     list(
          text = msg$content %||% "",
          tool_calls = tool_calls,
+         cancelled = isTRUE(attr(resp, "llm_cancelled")),
+         # Same chat-completions wire as OpenAI: "length" = cut off.
+         truncated = identical(resp$choices[[1]]$finish_reason, "length"),
+         truncation_reason = if (identical(resp$choices[[1]]$finish_reason,
+                "length")) {
+            "length"
+        },
          assistant_message = msg,
          usage = resp$usage
     )
@@ -691,15 +977,69 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
 }
 
 # Helper: POST JSON request
-.post_json <- function(url, body, headers) {
-    h <- curl::new_handle()
-    curl::handle_setopt(h,
-                        customrequest = "POST",
-                        postfields = jsonlite::toJSON(body, auto_unbox = TRUE, null = "null")
-    )
-    curl::handle_setheaders(h, .list = as.list(headers))
+# Is this error the transport's (timeout, reset, DNS, refused, stall)
+# rather than the API's or ours? curl_fetch_memory() signals a classed
+# `curl_error` with libcurl's text. curl_fetch_stream() goes through an
+# R connection: libcurl's text arrives as a *warning* ("Failed to open
+# 'url': ... Couldn't connect to server") and the error itself is R's
+# generic "cannot open the connection", so the caller passes the
+# warnings it saw as `notes` and both are matched. The generic
+# connection messages count too: inside these transports the only
+# connection there is is curl's.
+.llm_is_transport_error <- function(e, notes = character()) {
+    inherits(e, "curl_error") ||
+    grepl(paste0("Timeout was reached|Operation too slow|Recv failure|",
+                 "Send failure|Connection reset|Could not resolve|",
+                 "Couldn't connect|Failed to connect|Failed to open|",
+                 "Empty reply|Failure when receiving|",
+                 "Transferred a partial|connection to .* failed|",
+                 "SSL|OpenSSL|cannot open the connection|",
+                 "cannot read from connection|error reading from connection"),
+          paste(c(conditionMessage(e), notes), collapse = " "),
+          ignore.case = TRUE)
+}
 
-    resp <- curl::curl_fetch_memory(url, handle = h)
+# One retry for a request the transport lost before any byte of the
+# response arrived: a transport error on a call whose `received()`
+# says nothing came back. A request that had started to answer is not
+# retried -- re-sending it bills the generation twice and can duplicate
+# a side effect. Anything that is not the transport's (an API error, a
+# bug) propagates untouched. The wait between attempts is
+# `getOption("llm.api.transport_wait", 5)` seconds.
+.llm_transport_retry <- function(run, received = function() FALSE,
+                                 wait = getOption("llm.api.transport_wait", 5)) {
+    notes <- character()
+    attempt <- function() {
+        withCallingHandlers(run(), warning = function(w) {
+            notes <<- c(notes, conditionMessage(w))
+        })
+    }
+    tryCatch(attempt(), error = function(e) {
+        if (!.llm_is_transport_error(e, notes) || isTRUE(received())) {
+            stop(e)
+        }
+        Sys.sleep(wait)
+        attempt()
+    })
+}
+
+.post_json <- function(url, body, headers) {
+    .llm_assert_translated(body$messages, "the request body")
+    payload <- jsonlite::toJSON(body, auto_unbox = TRUE, null = "null")
+    request <- .request_new(payload,
+        if (.is_anthropic(.request_runtime$current$provider %||% "")) {
+            "messages"
+        } else {
+            "chat_completions"
+        },
+                            body$model)
+    run <- function() {
+        h <- curl::new_handle()
+        curl::handle_setopt(h, customrequest = "POST", postfields = payload)
+        curl::handle_setheaders(h, .list = as.list(headers))
+        .request_fetch(request, curl::curl_fetch_memory(url, handle = h))
+    }
+    resp <- .llm_transport_retry(run)
 
     if (resp$status_code >= 400) {
         err <- tryCatch(
@@ -724,7 +1064,7 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
 #' @param system Character. Default system prompt.
 #' @param model Character. Default model.
 #' @param provider Character. Provider: "anthropic", "anthropic_claude", "openai", "moonshot",
-#'   "openai_codex", "ollama", or "openai_compatible".
+#'   "google", "openai_codex", "ollama", or "openai_compatible".
 #' @param verbose Logical. Print tool calls.
 #'
 #' @return A function that takes a prompt and returns a response.
@@ -749,7 +1089,7 @@ agent <- function(prompt, tools = list(), tool_handler = NULL, system = NULL,
 #' }
 create_agent <- function(servers = list(), system = NULL, model = NULL,
                          provider = c("anthropic", "anthropic_claude", "openai", "moonshot",
-                                      "openai_codex", "ollama", "openai_compatible"),
+                                      "google", "openai_codex", "ollama", "openai_compatible"),
                          verbose = TRUE) {
     provider <- match.arg(provider)
 

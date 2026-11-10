@@ -7,6 +7,11 @@
 
     # Check base URL first
     if (!is.null(base)) {
+        # Before the "openai" test: Gemini's compat base ends in
+        # /v1beta/openai.
+        if (grepl("googleapis\\.com", base, ignore.case = TRUE)) {
+            return("google")
+        }
         if (grepl("moonshot|kimi", base, ignore.case = TRUE)) {
             return("moonshot")
         }
@@ -31,6 +36,9 @@
         }
         if (grepl("^kimi|^moonshot-v1", model, ignore.case = TRUE)) {
             return("moonshot")
+        }
+        if (grepl("^gemini", model, ignore.case = TRUE)) {
+            return("google")
         }
         if (grepl("^(llama|mistral|phi|qwen|gemma|codellama|deepseek)", model,
                   ignore.case = TRUE)) {
@@ -67,7 +75,7 @@
                          base_url = base %||% "https://api.openai.com",
                          chat_path = "/v1/chat/completions",
                          api_key = .get_key("openai"),
-                         default_model = "gpt-5.4-mini"),
+                         default_model = "gpt-6.1-sol"),
            anthropic = list(
                             provider = "anthropic",
                             base_url = base %||% "https://api.anthropic.com",
@@ -89,12 +97,20 @@
                            api_key = .get_key("moonshot"),
                            default_model = "kimi-k2.5"
         ),
+           google = list(
+                         provider = "google",
+                         base_url = base %||%
+                         "https://generativelanguage.googleapis.com/v1beta/openai",
+                         chat_path = "/chat/completions",
+                         api_key = .get_key("google"),
+                         default_model = "gemini-3.5-flash"
+        ),
            openai_codex = list(
                                provider = "openai_codex",
                                base_url = base %||% "https://chatgpt.com/backend-api",
                                chat_path = "/codex/responses",
                                credentials = openai_codex_credentials(),
-                               default_model = "gpt-5.5"
+                               default_model = "gpt-6.1-sol"
         ),
            ollama = list(
                          provider = "ollama",
@@ -160,8 +176,8 @@
 #' duplicating the lookup table.
 #'
 #' @param provider Character. One of `"openai"`, `"anthropic"`,
-#'   `"anthropic_claude"`, `"moonshot"`, `"openai_codex"`, `"ollama"`,
-#'   `"openai_compatible"`.
+#'   `"anthropic_claude"`, `"moonshot"`, `"google"`, `"openai_codex"`,
+#'   `"ollama"`, `"openai_compatible"`.
 #' @return Character. The default model id for that provider, or NULL
 #'   for `"openai_compatible"`, which has no default (the model id is
 #'   whatever the target gateway expects).
@@ -169,6 +185,7 @@
 #' @examples
 #' provider_default_model("anthropic")
 #' provider_default_model("moonshot")
+#' provider_default_model("google")
 provider_default_model <- function(provider) {
     .get_provider_config(provider)$default_model
 }
@@ -184,9 +201,9 @@ provider_default_model <- function(provider) {
 #' @examples
 #' \dontrun{
 #' chat_openai("Explain quantum computing")
-#' chat_openai("Write a haiku", model = "gpt-5.4-mini")
+#' chat_openai("Write a haiku", model = "gpt-6.1-sol")
 #' }
-chat_openai <- function(prompt, model = "gpt-5.4-mini", ...) {
+chat_openai <- function(prompt, model = "gpt-6.1-sol", ...) {
     chat(prompt, model = model, provider = "openai", ...)
 }
 
